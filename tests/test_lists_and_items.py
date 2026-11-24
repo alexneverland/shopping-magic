@@ -260,6 +260,107 @@ class ListsAndItemsTests(unittest.TestCase):
         })["result"]
         self.assertEqual(reopened_new_qty["remaining_quantity"], "4")
 
+    def test_renaming_item_reconciles_product_link_for_purchases(self) -> None:
+        typo = self.store.handle({
+            "action": "item-add",
+            "request_key": "rename-1",
+            "name": "Mlik",
+            "list_name": "Supermarket",
+        })["result"]
+        renamed = self.store.handle({
+            "action": "item-update",
+            "id": typo["id"],
+            "expected_revision": typo["revision"],
+            "request_key": "rename-2",
+            "name": "Milk",
+        })["result"]
+        self.assertEqual(renamed["name"], "Milk")
+        self.assertNotEqual(renamed["product_id"], typo["product_id"])
+
+        logged = self.store.handle({
+            "action": "purchase-log",
+            "request_key": "rename-buy",
+            "item_id": renamed["id"],
+            "bought_on": "2026-11-24",
+            "store": "AB",
+        })["result"]
+        self.assertEqual(logged["purchase"]["product_name"], "Milk")
+        self.assertEqual(logged["purchase"]["product_id"], renamed["product_id"])
+
+    def test_null_remaining_quantity_rejected_for_quantified_item(self) -> None:
+        milk = self.store.handle({
+            "action": "item-add",
+            "request_key": "null-rem-1",
+            "name": "Bottled Water",
+            "list_name": "Supermarket",
+            "quantity": "6",
+            "unit": "bottles",
+        })["result"]
+        with self.assertRaisesRegex(shopping_store.StoreError, "invalid_remaining_quantity"):
+            self.store.handle({
+                "action": "item-update",
+                "id": milk["id"],
+                "expected_revision": milk["revision"],
+                "request_key": "null-rem-bad",
+                "remaining_quantity": None,
+            })
+
+    def test_unit_conversion_when_updating_partially_bought_quantity(self) -> None:
+        flour = self.store.handle({
+            "action": "item-add",
+            "request_key": "conv-1",
+            "name": "Flour",
+            "list_name": "Supermarket",
+            "quantity": "2",
+            "unit": "kg",
+        })["result"]
+        partial = self.store.handle({
+            "action": "purchase-log",
+            "request_key": "conv-buy",
+            "item_id": flour["id"],
+            "bought_on": "2026-11-24",
+            "quantity": "1",
+            "unit": "kg",
+        })["result"]
+        self.assertEqual(partial["updated_item"]["status"], "partially_bought")
+        self.assertEqual(partial["updated_item"]["remaining_quantity"], "1")
+
+        # Updating target quantity with a compatible unit converts fulfilled 1 kg -> 1000 g.
+        converted = self.store.handle({
+            "action": "item-update",
+            "id": flour["id"],
+            "expected_revision": partial["updated_item"]["revision"],
+            "request_key": "conv-upd",
+            "quantity": "2000",
+            "unit": "g",
+        })["result"]
+        self.assertEqual(converted["remaining_quantity"], "1000")
+        self.assertEqual(converted["status"], "partially_bought")
+
+        # Incompatible unit change without explicit remaining_quantity fails atomically.
+        with self.assertRaisesRegex(shopping_store.StoreError, "incompatible_units"):
+            self.store.handle({
+                "action": "item-update",
+                "id": flour["id"],
+                "expected_revision": converted["revision"],
+                "request_key": "conv-bad",
+                "quantity": "4",
+                "unit": "packs",
+            })
+
+        # Explicit remaining_quantity is accepted when switching incompatible units.
+        explicit = self.store.handle({
+            "action": "item-update",
+            "id": flour["id"],
+            "expected_revision": converted["revision"],
+            "request_key": "conv-explicit",
+            "quantity": "4",
+            "unit": "packs",
+            "remaining_quantity": "2",
+        })["result"]
+        self.assertEqual(explicit["remaining_quantity"], "2")
+        self.assertEqual(explicit["unit"], "packs")
+
 
 if __name__ == "__main__":
     unittest.main()

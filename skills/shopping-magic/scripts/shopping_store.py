@@ -1886,11 +1886,26 @@ class Store:
         budget_amount = payload["budget_amount"] if "budget_amount" in payload else current["budget_amount"]
         budget_currency = payload.get("budget_currency", current["budget_currency"])
 
+        product_id = current["product_id"]
+        if "name" in payload and (
+            product_id is None or normalized(name) != normalized(current["name"])
+        ):
+            product_row = self._get_or_create_product(
+                con,
+                name,
+                default_list_id=list_id,
+                default_category=category,
+                default_unit=unit,
+                default_brand=brand,
+                default_store=preferred_store,
+            )
+            product_id = product_row["id"]
+
         qty = payload["quantity"] if "quantity" in payload else current["quantity"]
         status = payload.get("status", current["status"])
         if "remaining_quantity" in payload:
             rem = payload["remaining_quantity"]
-            if qty is None and rem is not None:
+            if (qty is None) != (rem is None):
                 raise StoreError("invalid_remaining_quantity")
         elif "quantity" in payload:
             if qty is None:
@@ -1900,8 +1915,13 @@ class Store:
                 and current["quantity"] is not None
                 and current["remaining_quantity"] is not None
             ):
-                already_bought = Decimal(current["quantity"]) - Decimal(current["remaining_quantity"])
-                new_rem = max(Decimal("0"), Decimal(qty) - max(Decimal("0"), already_bought))
+                already_bought = max(
+                    Decimal("0"),
+                    Decimal(current["quantity"]) - Decimal(current["remaining_quantity"]),
+                )
+                if already_bought > Decimal("0") and unit != current["unit"]:
+                    already_bought = convert_quantity(already_bought, current["unit"], unit)
+                new_rem = max(Decimal("0"), Decimal(qty) - already_bought)
                 rem = format_decimal(new_rem)
                 if "status" not in payload and current["status"] == "partially_bought" and new_rem == 0:
                     status = "bought"
@@ -1935,24 +1955,27 @@ class Store:
         else:
             resolved_at = None
 
+        if (qty is None) != (rem is None):
+            raise StoreError("invalid_remaining_quantity")
+
         search_text = self._item_search_text(
             name, category, brand, preferred_store, recipient, occasion, notes
         )
         con.execute(
             "UPDATE shopping_items SET "
-            "list_id=?, name=?, search_text=?, category=?, quantity=?, remaining_quantity=?, "
+            "list_id=?, product_id=?, name=?, search_text=?, category=?, quantity=?, remaining_quantity=?, "
             "unit=?, brand=?, preferred_store=?, notes=?, priority=?, status=?, target_date=?, "
             "recipient=?, occasion=?, occasion_recurring=?, budget_amount=?, budget_currency=?, "
             "revision=revision+1, updated_at=?, resolved_at=? WHERE id=?",
             (
-                list_id, name, search_text, category, qty, rem, unit, brand, preferred_store,
+                list_id, product_id, name, search_text, category, qty, rem, unit, brand, preferred_store,
                 notes, priority, status, target_date, recipient, occasion, occasion_recurring,
                 budget_amount, budget_currency, stamp, resolved_at, ident,
             ),
         )
 
-        if payload.get("remember_list_preference") and current["product_id"]:
-            prod = con.execute("SELECT * FROM products WHERE id=?", (current["product_id"],)).fetchone()
+        if payload.get("remember_list_preference") and product_id:
+            prod = con.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
             if prod:
                 prod_search = self._product_search_text(
                     prod["name"], json.loads(prod["aliases"]), prod["default_brand"], category, prod["notes"]
