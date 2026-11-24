@@ -6,7 +6,10 @@ correcting categories, logging purchases, or answering history/spending queries.
 ## 1. Conversational lists & implicit references
 
 1. Call `context` first to inspect current `lists`, `open_items`,
-   `category_preferences`, and `products`.
+   `category_preferences`, and `products`. Check `context.pagination`: if
+   `open_items.truncated` or `products.truncated` is `true`, paginate with
+   `item-list` (`status: "open"`, `offset`) or `product-search` (`query` /
+   `offset`) before assuming an item or product is absent.
 2. Resolve conversational updates in place:
    - *"We need milk and feta"* → `item-add` for each item with a unique
      `request_key`.

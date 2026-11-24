@@ -57,22 +57,35 @@ class StorageSafetyTests(unittest.TestCase):
         foreign_dir.mkdir()
         fdb = foreign_dir / "shopping-magic.sqlite3"
         con = sqlite3.connect(fdb)
+        con.execute("PRAGMA journal_mode = DELETE")
         con.execute("CREATE TABLE other (id INTEGER PRIMARY KEY)")
         con.commit()
         con.close()
+        foreign_before = fdb.read_bytes()
         with self.assertRaisesRegex(shopping_store.StoreError, "unrecognized_database"):
             shopping_store.Store(foreign_dir).handle({"action": "context"})
+        self.assertEqual(fdb.read_bytes(), foreign_before)
+        self.assertFalse((foreign_dir / "shopping-magic.sqlite3-wal").exists())
+        check_con = sqlite3.connect(fdb)
+        try:
+            self.assertEqual(check_con.execute("PRAGMA journal_mode").fetchone()[0].lower(), "delete")
+        finally:
+            check_con.close()
 
         newer_dir = self.base / "newer"
         newer_dir.mkdir()
         shopping_store.Store(newer_dir).handle({"action": "context"})
         ndb = newer_dir / "shopping-magic.sqlite3"
         con = sqlite3.connect(ndb)
+        con.execute("PRAGMA journal_mode = DELETE")
         con.execute("PRAGMA user_version = 99")
         con.commit()
         con.close()
+        newer_before = ndb.read_bytes()
         with self.assertRaisesRegex(shopping_store.StoreError, "unsupported_schema_version"):
             shopping_store.Store(newer_dir).handle({"action": "context"})
+        self.assertEqual(ndb.read_bytes(), newer_before)
+        self.assertFalse((newer_dir / "shopping-magic.sqlite3-wal").exists())
 
     def test_transactional_migration_and_rollback_on_failure(self) -> None:
         data_dir = self.base / "migrate"

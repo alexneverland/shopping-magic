@@ -7,8 +7,10 @@ purchases.
 
 Example: *"I need a birthday present for George by December 15, around €30."*
 
-1. Inspect `context` to check if a matching gift item already exists (avoid
-   duplicate entries for the same recipient and occasion).
+1. Inspect `context` (`upcoming_gifts` and `pagination.upcoming_gifts`) to check
+   if a matching gift item already exists (avoid duplicate entries for the same
+   recipient and occasion). If `pagination.upcoming_gifts.truncated` is `true`,
+   query `item-list` with `gifts_only: true` and `offset` (or `recipient`).
 2. Add or update the item on the `Gifts` list (`list_name: "Gifts"`,
    `list_kind: "gifts"`) with only explicitly provided facts:
    - `name`: e.g., `"Birthday present for George"` (or the specific gift idea if

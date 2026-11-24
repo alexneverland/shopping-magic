@@ -66,7 +66,7 @@ the database or replaying receipts.
 | Action | Required fields | Optional fields | Result summary |
 |---|---|---|---|
 | `storage-info` | — | — | Read-only paths, existence, `profile_id`, table counts |
-| `context` | — | `as_of` (`YYYY-MM-DD`), `horizon_days` (1–90, default 7), `recent_purchases_limit` (1–100, default 20) | Lists, open items, upcoming gifts, category prefs, products, recent purchases, secondary `replenishment_suggestions`, top-level `storage` |
+| `context` | — | `as_of` (`YYYY-MM-DD`), `horizon_days` (1–90, default 7), `recent_purchases_limit` (1–100, default 20) | Lists, open items, upcoming gifts (queried independently), category prefs, products, recent purchases, secondary `replenishment_suggestions`, `pagination` (`returned`, `total`, `truncated`, `next_offset`), top-level `storage` |
 | `list-save` | `name` | `id`, `kind`, `notes`, `archived` | Created or updated list with counts |
 | `list-list` | — | `include_archived` (bool, default false) | Lists with `open_count` and `total_count` |
 | `product-save` | `name` | `id`, `expected_revision`, `aliases`, `default_list_id`, `default_list_name`, `default_list_kind`, `default_category`, `default_unit`, `default_brand`, `default_store`, `notes` | Canonical product identity and defaults |
@@ -75,7 +75,7 @@ the database or replaying receipts.
 | `category-pref-remove` | `id` | — | Removed routing preference |
 | `item-add` | `name`, `request_key`, plus `list_id` or `list_name` (or linked product default list) | `list_kind`, `product_id`, `category`, `quantity`, `unit`, `brand`, `preferred_store`, `notes`, `priority`, `status` (`idea`/`planned`/`needed`), `target_date`, `recipient`, `occasion`, `occasion_recurring`, `budget_amount`, `budget_currency` | Created shopping item with `revision: 1` |
 | `item-get` | `id` | — | Single hydrated shopping item |
-| `item-list` | — | `list_id`, `list_name`, `list_kind`, `category`, `status` (default `open`, or `all`, or exact status), `recipient`, `product_id`, `due_before`, `due_after`, `query`, `limit` (1–100, default 50), `offset` | Matching shopping items only (no replenishment estimates) |
+| `item-list` | — | `list_id`, `list_name`, `list_kind`, `category`, `status` (default `open`, or `all`, or exact status), `recipient`, `product_id`, `due_before`, `due_after`, `gifts_only` (bool), `query`, `limit` (1–100, default 50), `offset` | Matching shopping items only (no replenishment estimates) |
 | `item-update` | `id`, `expected_revision`, `request_key` (plus at least one updatable field) | `name`, `list_id`, `list_name`, `list_kind`, `category`, `quantity`, `remaining_quantity`, `unit`, `brand`, `preferred_store`, `notes`, `priority`, `status`, `target_date`, `recipient`, `occasion`, `occasion_recurring`, `budget_amount`, `budget_currency`, `remember_list_preference` | Updated item with incremented revision |
 | `item-remove` | `id`, `request_key` | `expected_revision` | Removed item (`purchases` preserved) |
 | `list-clear` | `request_key`, `confirm` (`true`), plus `list_id` or `list_name` | `statuses` (list of statuses; default open statuses) | Removed item count; preserves purchases |

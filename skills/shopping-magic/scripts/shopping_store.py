@@ -894,6 +894,17 @@ class Store:
             "counts": counts,
         }
 
+    @staticmethod
+    def _run_migrations(con: sqlite3.Connection, version: int) -> int:
+        while version < SCHEMA_VERSION:
+            migrator = MIGRATIONS.get(version)
+            if migrator is None:
+                raise StoreError("unsupported_schema_version")
+            migrator(con)
+            version += 1
+            con.execute(f"PRAGMA user_version = {int(version)}")
+        return version
+
     def _connect(self, *, use_wal: bool = True) -> sqlite3.Connection:
         self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         checked_path(self.path)
@@ -905,10 +916,6 @@ class Store:
         try:
             con.execute("PRAGMA busy_timeout = 10000")
             con.execute("PRAGMA foreign_keys = ON")
-            if use_wal:
-                mode_row = con.execute("PRAGMA journal_mode").fetchone()
-                if mode_row and str(mode_row[0]).lower() != "wal":
-                    con.execute("PRAGMA journal_mode = WAL")
             con.execute("BEGIN IMMEDIATE")
             version = con.execute("PRAGMA user_version").fetchone()[0]
             if version == 0:
@@ -918,19 +925,39 @@ class Store:
                     con.execute(statement)
                 con.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
                 version = SCHEMA_VERSION
+                initialized_here = True
             else:
-                while version < SCHEMA_VERSION:
-                    migrator = MIGRATIONS.get(version)
-                    if migrator is None:
-                        raise StoreError("unsupported_schema_version")
-                    migrator(con)
-                    version += 1
-                    con.execute(f"PRAGMA user_version = {int(version)}")
-                if version != SCHEMA_VERSION:
+                initialized_here = False
+                if version > SCHEMA_VERSION:
                     raise StoreError("unsupported_schema_version")
                 tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if not (CORE_TABLES <= tables):
                     raise StoreError("unrecognized_database")
+
+            if use_wal:
+                mode_row = con.execute("PRAGMA journal_mode").fetchone()
+                if mode_row and str(mode_row[0]).lower() != "wal":
+                    if not initialized_here:
+                        qc = [r[0] for r in con.execute("PRAGMA quick_check").fetchall()]
+                        if qc != ["ok"]:
+                            raise StoreError("invalid_database")
+                        if con.execute("PRAGMA foreign_key_check").fetchone():
+                            raise StoreError("invalid_database")
+                    # Persist initial schema or release validation lock before enabling WAL,
+                    # since SQLite forbids changing journal_mode inside an active transaction.
+                    con.execute("COMMIT" if initialized_here else "ROLLBACK")
+                    con.execute("PRAGMA journal_mode = WAL")
+                    con.execute("BEGIN IMMEDIATE")
+                    version = con.execute("PRAGMA user_version").fetchone()[0]
+                    if version > SCHEMA_VERSION:
+                        raise StoreError("unsupported_schema_version")
+                    tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    if version == 0 or not (CORE_TABLES <= tables):
+                        raise StoreError("unrecognized_database")
+
+            version = self._run_migrations(con, version)
+            if version != SCHEMA_VERSION:
+                raise StoreError("unsupported_schema_version")
             return con
         except sqlite3.DatabaseError as exc:
             try:
@@ -987,7 +1014,7 @@ class Store:
                 {
                     "list_id", "list_name", "list_kind", "category", "status",
                     "recipient", "product_id", "due_before", "due_after",
-                    "query", "limit", "offset",
+                    "gifts_only", "query", "limit", "offset",
                 },
             ),
             "item-update": (
@@ -1765,6 +1792,8 @@ class Store:
             due_after = date_field(req, "due_after").isoformat()
             clauses.append("i.target_date IS NOT NULL AND i.target_date >= ?")
             params.append(due_after)
+        if boolean_field(req, "gifts_only", False):
+            clauses.append("(l.kind = 'gifts' OR i.recipient <> '' OR i.occasion <> '')")
 
         if "query" in req and req["query"] is not None:
             query = req["query"]
@@ -2783,13 +2812,21 @@ class Store:
             else 20
         )
 
+        context_limit = 100
         lists = self._list_list(con, {"include_archived": False})
-        open_items = self._item_list(con, {"status": "open", "limit": 100})
-        upcoming_gifts = [
-            item
-            for item in open_items
-            if item["list_kind"] == "gifts" or item["recipient"] or item["occasion"]
-        ]
+        open_items = self._item_list(con, {"status": "open", "limit": context_limit})
+        total_open_items = con.execute(
+            "SELECT count(*) FROM shopping_items WHERE status IN ('idea','planned','needed','partially_bought')"
+        ).fetchone()[0]
+        upcoming_gifts = self._item_list(
+            con,
+            {"status": "open", "gifts_only": True, "limit": context_limit},
+        )
+        total_upcoming_gifts = con.execute(
+            "SELECT count(*) FROM shopping_items i JOIN lists l ON l.id = i.list_id "
+            "WHERE i.status IN ('idea','planned','needed','partially_bought') "
+            "AND (l.kind = 'gifts' OR i.recipient <> '' OR i.occasion <> '')"
+        ).fetchone()[0]
         category_prefs = [
             dict(r)
             for r in con.execute(
@@ -2798,12 +2835,23 @@ class Store:
                 "ORDER BY cp.topic COLLATE NOCASE ASC, cp.id"
             ).fetchall()
         ]
-        products = self._product_search(con, {"limit": 100})
+        products = self._product_search(con, {"limit": context_limit})
+        total_products = con.execute("SELECT count(*) FROM products").fetchone()[0]
         recent_purchases = self._purchase_list(con, {"limit": recent_limit})
+        total_purchases = con.execute("SELECT count(*) FROM purchases").fetchone()[0]
         suggestions = self._replenishment_suggestions(
             con,
             {"as_of": as_of.isoformat(), "horizon_days": horizon_days},
         )["suggestions"]
+
+        def page_meta(rows: list[Any], total: int) -> dict[str, Any]:
+            truncated = len(rows) < total
+            return {
+                "returned": len(rows),
+                "total": total,
+                "truncated": truncated,
+                "next_offset": len(rows) if truncated else None,
+            }
 
         return {
             "as_of": as_of.isoformat(),
@@ -2814,6 +2862,12 @@ class Store:
             "products": products,
             "recent_purchases": recent_purchases,
             "replenishment_suggestions": suggestions,
+            "pagination": {
+                "open_items": page_meta(open_items, total_open_items),
+                "upcoming_gifts": page_meta(upcoming_gifts, total_upcoming_gifts),
+                "products": page_meta(products, total_products),
+                "recent_purchases": page_meta(recent_purchases, total_purchases),
+            },
         }
 
     def _export(self, con: sqlite3.Connection, req: dict[str, Any]) -> dict[str, Any]:
