@@ -850,7 +850,11 @@ class Store:
             and sys.platform == "win32"
         )
         selected = Path(data_dir).expanduser() if data_dir else default_data_dir()
-        self.data_dir = checked_path(selected) if self.shared_windows else checked_path(selected).resolve()
+        self.data_dir = (
+            checked_path(selected)
+            if (self.shared_windows or sys.platform == "win32")
+            else selected.resolve()
+        )
         install = Path(__file__).resolve().parents[1]
         if self.data_dir == install or install in self.data_dir.parents:
             raise StoreError("data_directory_inside_skill")

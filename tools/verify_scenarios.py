@@ -365,7 +365,7 @@ def run_level1() -> dict[str, Any]:
         t0 = time.perf_counter()
         with tempfile.TemporaryDirectory(prefix=f"sm-scn-{name}-") as tmp:
             try:
-                details = fn(Path(tmp))
+                details = fn(Path(tmp).resolve())
                 status = "passed"
                 passed += 1
                 error = None
