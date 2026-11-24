@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -283,6 +284,48 @@ class StorageSafetyTests(unittest.TestCase):
         rc_orig, err_orig = call_default({"action": "context"})
         self.assertEqual(rc_orig, 1)
         self.assertEqual(err_orig["error"], "invalid_profile_origins")
+
+    @unittest.skipUnless(os.name == "nt", "Windows shared profile migration guard")
+    def test_windows_shared_schema_upgrade_waits_for_all_default_hosts(self) -> None:
+        home = self.base / "shared-upgrade"
+        other_host = home / ".gemini/config/skills/shopping-magic/scripts/shopping_store.py"
+        other_host.parent.mkdir(parents=True)
+        other_host.write_text("SCHEMA_VERSION = 2\n", encoding="utf-8")
+        env = dict(os.environ, USERPROFILE=str(home), SHOPPING_MAGIC_DATA_DIR="")
+        profile = home / ".shopping-magic/data"
+        db_path = profile / "shopping-magic.sqlite3"
+
+        def context() -> tuple[int, dict]:
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT)], input='{"action":"context"}',
+                env=env, capture_output=True, text=True, encoding="utf-8",
+            )
+            return result.returncode, json.loads(result.stdout)
+
+        blocked = (1, {"ok": False, "error": "shared_profile_upgrade_requires_compatible_hosts"})
+        self.assertEqual(context(), blocked)
+        self.assertFalse(db_path.exists())
+
+        old_schema = tuple(
+            statement.replace(", replenishment_basis_quantity TEXT", "")
+            .replace(", replenishment_basis_unit TEXT NOT NULL DEFAULT ''", "")
+            for statement in shopping_store.SCHEMA
+        )
+        with patch.object(shopping_store, "SCHEMA_VERSION", 2), patch.object(shopping_store, "SCHEMA", old_schema):
+            shopping_store.Store(profile).handle({
+                "action": "item-add", "request_key": "legacy", "name": "Coffee", "list_name": "Audit",
+            })
+        self.assertEqual(context(), blocked)
+        with closing(sqlite3.connect(db_path)) as con:
+            self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 2)
+        other_host.write_text("SCHEMA_VERSION = 3\n", encoding="utf-8")
+        code, response = context()
+        self.assertEqual(code, 0, response)
+        self.assertEqual(response["result"]["open_items"][0]["name"], "Coffee")
+        with closing(sqlite3.connect(db_path)) as con:
+            self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 3)
+        other_host.write_text("SCHEMA_VERSION = 2\n", encoding="utf-8")
+        self.assertEqual(context()[0], 0)
 
     @unittest.skipUnless(os.name == "nt", "Windows junction data-dir guard")
     def test_windows_junction_data_dir_refused(self) -> None:

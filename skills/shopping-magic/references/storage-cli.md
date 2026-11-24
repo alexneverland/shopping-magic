@@ -54,6 +54,11 @@ physical file safely:
   changes OS file identity (`shared_profile_identity_changed`), or `.origins.json`
   is malformed (`invalid_profile_origins`), the helper fails closed rather than
   creating a blank profile.
+- If a helper at a default Codex, Claude Code, or Antigravity user installation
+  path declares a different schema or cannot be verified, creation or migration
+  of the shared profile stops with `shared_profile_upgrade_requires_compatible_hosts`.
+  Close and update all hosts sharing the profile before retrying. Coordinate
+  project-scoped and custom installations manually.
 - Unrecognized SQLite/non-SQLite files (`unrecognized_database`), corrupt DBs
   (`invalid_database`), and newer schema versions (`unsupported_schema_version`)
   are refused without resetting user data.
@@ -123,15 +128,21 @@ the database or replaying receipts.
   supplying a new quantity, the helper converts both stored quantities. An
   incompatible unit fails with `incompatible_units`. An explicit
   `remaining_quantity` is always interpreted in the requested unit.
+- **Unit-only purchase edits:** A compatible change converts the recorded
+  quantity without changing the physical amount or the linked item's remainder.
+  To correct an originally wrong unit label or change the physical amount,
+  provide the corrected quantity and unit together.
 - **Purchase identity and store:** When supplied together, `item_id`,
   `product_id`, and `product_name` must identify the same product, including
   recognized aliases. A mismatch returns `purchase_product_mismatch`.
   Purchase `store` is empty when omitted. A list item's `preferred_store`
-  never supplies the actual store used for spending totals.
+  can supply a newly linked product's default store. Spending totals use the
+  actual purchase `store`.
 - **Linked purchase corrections:** A quantity or unit change on an automatic
   fulfillment reapplies the purchase to the original remaining quantity. A
   removal restores the prior status and remainder. These changes are atomic
-  and require evidence that the linked item revision still matches. Otherwise,
+  and require evidence that the linked item revision and recorded fulfillment
+  still match. Otherwise,
   the CLI returns `purchase_item_state_requires_review`. After the user
   decides to change history while preserving the current list item, retry
   with `keep_item_state: true`. Quantity and unit changes on a purchase
@@ -152,6 +163,8 @@ basis of replenishment rules. Schema 1 and 2 snapshots can still be imported.
 Existing SQLite databases migrate to schema 3 on use, preserving purchases
 and retry receipts. Legacy linked purchases have no
 fulfillment metadata, so corrections that would affect the list require review.
+An imported fulfillment effect that could be used to restore an item must
+contain a valid prior remainder and reproduce the current recorded item state.
 `import` requires a completely empty destination profile (no rows in any domain
 table or `mutation_requests`), failing with `import_requires_empty_profile`
 otherwise. For a complete byte-exact backup including retry receipts, close all
