@@ -6,7 +6,7 @@ evaluated separately.
 
 ## Observed deterministic verification
 
-Executed from `c:\Shopping Mgic` on Windows with Python 3.14.10:
+Executed from the repository root on Windows with Python 3.14.10:
 
 ```powershell
 python tools\check_repository.py
