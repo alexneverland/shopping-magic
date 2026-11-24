@@ -6,7 +6,7 @@ evaluated separately.
 
 ## Observed deterministic verification
 
-Executed from the repository root for 0.1.2 on Windows with Python 3.14.10:
+Executed from the repository root for 0.1.3 on Windows with Python 3.14.10:
 
 ```powershell
 python tools\check_repository.py
@@ -17,8 +17,8 @@ python tools\build_package.py
 
 - `tools/check_repository.py`: passed (`Repository checks passed (layout, local links, LICENSE sync, stdlib imports, whitespace).`).
 - `tools/verify_scenarios.py`: Level 1 passed **8/8** deterministic storage scenarios (`natural_needs_and_followup_edits`, `category_correction_and_preference`, `partial_purchase_and_unit_guard`, `confirmed_needs_vs_predictions`, `history_and_incomplete_spending`, `replenishment_feedback_and_historical_median`, `gifts_planned_vs_purchased`, `prompt_injection_and_readonly_invariants`). Level 2 (`LiveAgentAdapter`) reported `status: "not_executed"` (`no_live_adapter_configured`).
-- `python -m unittest discover -s tests -v`: passed **56/56** unit and lifecycle tests. Quantity-based coverage includes counts, metric conversion, missing or incompatible units, quantity corrections, fixed-rule replacement and snapshot restore. The suite also covers linked purchase correction and removal, migration rollback and legacy snapshots.
-- `tools/build_package.py`: built `dist/shopping-magic-0.1.2.zip` (31 allowlisted entries) and its `.sha256` sidecar.
+- `python -m unittest discover -s tests -v`: passed **60/60** unit and lifecycle tests. The PR #3 follow-up covers physical quantity preservation, history changes on correction and removal, invalid fulfillment snapshots, preferred-store retention, and the Windows shared-profile migration guard.
+- `tools/build_package.py`: built `dist/shopping-magic-0.1.3.zip` (31 allowlisted entries) and its `.sha256` sidecar.
 
 ## Live conversational verification status
 

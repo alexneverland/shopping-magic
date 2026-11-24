@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import calendar
 from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -22,7 +23,7 @@ from typing import Any, Callable
 import unicodedata
 import uuid
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 SCHEMA_VERSION = 3
 
 LIST_KINDS = ("supermarket", "home", "gifts", "pharmacy", "personal_care", "custom")
@@ -437,6 +438,48 @@ def convert_quantity(qty: Decimal, from_unit: str, to_unit: str) -> Decimal:
     return (qty * from_factor) / to_factor
 
 
+def purchase_fulfillment_balance(
+    item_quantity: str | None, remaining: str | None, item_unit: str,
+    mode: str, purchase_quantity: str | None, purchase_unit: str,
+) -> tuple[str, str | None]:
+    if mode == "auto" and remaining is not None and purchase_quantity is not None:
+        bought = convert_quantity(Decimal(purchase_quantity), purchase_unit, item_unit)
+        balance = Decimal(remaining) - bought
+        if balance > 0:
+            return "partially_bought", format_decimal(balance)
+    return "bought", "0" if item_quantity is not None else None
+
+
+def valid_saved_remainder(total: str | None, remaining: str | None) -> bool:
+    if total is None or remaining is None:
+        return total is None and remaining is None
+    return 0 < Decimal(remaining) <= Decimal(total)
+
+
+def saved_fulfillment_matches_item(
+    item: sqlite3.Row | dict[str, Any], purchase: sqlite3.Row | dict[str, Any], effect: dict[str, Any]
+) -> bool:
+    if (
+        effect["revision"] != item["revision"]
+        or effect["status"] not in ITEM_OPEN_STATUSES
+        or (item["product_id"] is not None and purchase["product_id"] != item["product_id"])
+        or not valid_saved_remainder(item["quantity"], effect["remaining_quantity"])
+    ):
+        return False
+    try:
+        status, remaining = purchase_fulfillment_balance(
+            item["quantity"], effect["remaining_quantity"], item["unit"],
+            effect["mode"], purchase["quantity"], purchase["unit"],
+        )
+    except StoreError:
+        return False
+    actual = item["remaining_quantity"]
+    return status == item["status"] and (
+        remaining == actual
+        or (remaining is not None and actual is not None and Decimal(remaining) == Decimal(actual))
+    )
+
+
 def quantity_replenishment_date(
     product: sqlite3.Row | dict[str, Any], bought_on: date, quantity: str | None, unit: str
 ) -> date | None:
@@ -818,10 +861,7 @@ def validate_snapshot(data: Any) -> dict[str, Any]:
                 item = items_by_id[row["shopping_item_id"]]
                 if effect["revision"] > item["revision"]:
                     raise StoreError("invalid_import_fulfillment")
-                if effect["revision"] == item["revision"] and (
-                    (effect["remaining_quantity"] is None) != (item["quantity"] is None)
-                    or (item["product_id"] is not None and row["product_id"] != item["product_id"])
-                ):
+                if effect["revision"] == item["revision"] and not saved_fulfillment_matches_item(item, row, effect):
                     raise StoreError("invalid_import_fulfillment")
 
     return data
@@ -848,6 +888,31 @@ def _validate_existing_database(path: Path) -> None:
         if not isinstance(exc, sqlite3.OperationalError):
             raise StoreError("invalid_database") from None
         raise
+
+
+def check_shared_host_schemas(user_home: Path) -> None:
+    """Check default Windows installs before raising the profile schema."""
+    for root in (".agents/skills", ".claude/skills", ".gemini/config/skills"):
+        script = user_home / root / "shopping-magic/scripts/shopping_store.py"
+        try:
+            script.lstat()
+        except FileNotFoundError:
+            continue
+        checked_path(script)
+        try:
+            module = ast.parse(script.read_text(encoding="utf-8"))
+        except (OSError, ValueError, SyntaxError):
+            raise StoreError("shared_profile_upgrade_requires_compatible_hosts") from None
+        declarations = [
+            statement.value
+            for statement in module.body if isinstance(statement, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "SCHEMA_VERSION" for target in statement.targets)
+        ]
+        if len(declarations) != 1 or not isinstance(declarations[0], ast.Constant):
+            raise StoreError("shared_profile_upgrade_requires_compatible_hosts")
+        version = declarations[0].value
+        if type(version) is not int or version != SCHEMA_VERSION:
+            raise StoreError("shared_profile_upgrade_requires_compatible_hosts")
 
 
 def prepare_shared_profile(target: Path) -> None:
@@ -884,6 +949,7 @@ def prepare_shared_profile(target: Path) -> None:
         write_origins(marker, record)
         return
 
+    check_shared_host_schemas(target.parent.parent.parent)
     profile_id = origins["profile_id"] if origins else uuid.uuid4().hex
     with tempfile.TemporaryDirectory(prefix=".shopping-magic-init-", dir=target.parent) as temporary:
         stage_dir = Path(temporary)
@@ -1023,6 +1089,8 @@ class Store:
                     if version == 0 or not (CORE_TABLES <= tables):
                         raise StoreError("unrecognized_database")
 
+            if self.shared_windows and version < SCHEMA_VERSION:
+                check_shared_host_schemas(self.data_dir.parent.parent)
             version = self._run_migrations(con, version)
             if version != SCHEMA_VERSION:
                 raise StoreError("unsupported_schema_version")
@@ -2172,14 +2240,10 @@ class Store:
         con: sqlite3.Connection, item: sqlite3.Row, effect: dict[str, Any],
         quantity: str | None, unit: str, stamp: str,
     ) -> None:
-        remaining = effect["remaining_quantity"]
-        if effect["mode"] == "auto" and remaining is not None and quantity is not None:
-            bought = convert_quantity(Decimal(quantity), unit, item["unit"])
-            balance = Decimal(remaining) - bought
-            if balance > 0:
-                Store._write_item_fulfillment(con, item, "partially_bought", format_decimal(balance), stamp)
-                return
-        Store._write_item_fulfillment(con, item, "bought", "0" if item["quantity"] is not None else None, stamp)
+        status, remaining = purchase_fulfillment_balance(
+            item["quantity"], effect["remaining_quantity"], item["unit"], effect["mode"], quantity, unit,
+        )
+        Store._write_item_fulfillment(con, item, status, remaining, stamp)
 
     def _purchase_log(self, con: sqlite3.Connection, req: dict[str, Any]) -> dict[str, Any]:
         key = text_field(req, "request_key", limit=200)
@@ -2307,7 +2371,7 @@ class Store:
                 default_category=effective_category,
                 default_unit=unit,
                 default_brand=effective_brand,
-                default_store=store,
+                default_store=store or (item_row["preferred_store"] if item_row else ""),
             )
         if effective_list_id is None and product_row["default_list_id"]:
             effective_list_id = product_row["default_list_id"]
@@ -2334,7 +2398,10 @@ class Store:
                 )
                 self._apply_purchase_fulfillment(con, item_row, effect, quantity, unit, stamp)
                 updated_item = self._hydrate_item(self._fetch_item_row(con, item_row["id"]))
-            fulfillment = json.dumps(effect)
+            if fulfillment_mode == "keep_open" or valid_saved_remainder(
+                item_row["quantity"], item_row["remaining_quantity"],
+            ):
+                fulfillment = json.dumps(effect)
 
         purchase_id = uuid.uuid4().hex
         search_text = self._purchase_search_text(
@@ -2379,7 +2446,7 @@ class Store:
         if effect is None:
             raise StoreError("purchase_item_state_requires_review")
         item = self._fetch_item_row(con, purchase["shopping_item_id"])
-        if item["revision"] != effect["revision"]:
+        if not saved_fulfillment_matches_item(item, purchase, effect):
             raise StoreError("purchase_item_state_requires_review")
         return item
 
@@ -2439,9 +2506,14 @@ class Store:
 
         quantity = payload["quantity"] if "quantity" in payload else current["quantity"]
         unit = payload.get("unit", current["unit"])
+        unit_only = "quantity" not in payload and unit != current["unit"]
+        if unit_only and quantity is not None:
+            quantity = parse_decimal(
+                format_decimal(convert_quantity(Decimal(quantity), current["unit"], unit)), "quantity",
+            )
         stamp = now()
         fulfillment = current["fulfillment"]
-        if current["shopping_item_id"] is not None and (quantity, unit) != (current["quantity"], current["unit"]):
+        if current["shopping_item_id"] is not None and not unit_only and (quantity, unit) != (current["quantity"], current["unit"]):
             effect = json.loads(fulfillment) if fulfillment is not None else None
             if effect is None or effect["mode"] == "auto":
                 if payload.get("keep_item_state"):

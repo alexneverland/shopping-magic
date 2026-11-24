@@ -4,7 +4,7 @@ A local-first AI shopping assistant skill for **OpenAI Codex CLI**, **Claude Cod
 
 Talk to your agent naturally — *"We're out of feta"*, *"Add four E27 light bulbs"*, *"I needed six bottles of milk, bought four"*, *"I need a birthday present for George by December 15, around €30"*, or *"When did I last buy coffee?"* — while a zero-dependency Python standard-library SQLite engine stores your lists, purchase history, gift plans, and replenishment cycles on your own computer.
 
-**Source version 0.1.2** · [Download the latest release (ZIP and SHA-256)](https://github.com/alexneverland/shopping-magic/releases/latest) · [All releases](https://github.com/alexneverland/shopping-magic/releases) · [Verification record](VERIFICATION.md)
+**Source version 0.1.3** · [Download the latest release (ZIP and SHA-256)](https://github.com/alexneverland/shopping-magic/releases/latest) · [All releases](https://github.com/alexneverland/shopping-magic/releases) · [Verification record](VERIFICATION.md)
 
 ## Why Shopping Magic exists
 
@@ -168,7 +168,7 @@ On Windows without an override, `.origins.json` records the shared profile's ID 
 - **Portable JSON export/import:**
   - `{"action":"export"}` emits a portable `schema_version: 3` JSON snapshot, including purchase fulfillment and the quantity basis of replenishment rules. Retry receipts are excluded.
   - `{"action":"import","request_key":"...","data":<export result>}` atomically restores a version 1, 2, or 3 snapshot into an **empty** destination profile (`import_requires_empty_profile` refuses non-empty targets).
-  - Existing SQLite profiles migrate automatically to schema 3. Update every host sharing the profile before using it with 0.1.2. Purchases created under schema 1 need an explicit review before a linked quantity correction or deletion.
+  - Existing SQLite profiles migrate automatically to schema 3. On Windows, creation or migration of the default shared profile waits until the helpers in the default Codex, Claude Code, and Antigravity user installation paths agree on the schema. Close and update all hosts sharing the profile before using it, including project-scoped and custom installations. Purchases created under schema 1 need an explicit review before a linked quantity correction or deletion.
 
 ## Running tests
 
