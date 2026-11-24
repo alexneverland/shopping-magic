@@ -327,6 +327,42 @@ class StorageSafetyTests(unittest.TestCase):
         self.assertEqual(ver.returncode, 0)
         self.assertIn(shopping_store.VERSION, ver.stdout)
 
+    def test_export_import_preserves_long_500_char_product_name(self) -> None:
+        long_name = "A" * 500
+        src = shopping_store.Store(self.base / "long-src")
+        src.handle({
+            "action": "item-add",
+            "request_key": "long-1",
+            "name": long_name,
+            "list_name": "Supermarket",
+        })
+        exported = src.handle({"action": "export"})["result"]
+        dst = shopping_store.Store(self.base / "long-dst")
+        res = dst.handle({"action": "import", "request_key": "long-imp", "data": exported})["result"]
+        self.assertTrue(res["imported"])
+        self.assertEqual(dst.handle({"action": "export"})["result"], exported)
+
+    def test_refuses_symlinked_database_file(self) -> None:
+        other_dir = self.base / "other-profile"
+        other_store = shopping_store.Store(other_dir)
+        other_store.handle({
+            "action": "item-add",
+            "request_key": "sym-other",
+            "name": "Private Other Item",
+            "list_name": "Home",
+        })
+        link_dir = self.base / "symlinked-db-dir"
+        link_dir.mkdir()
+        link_db = link_dir / "shopping-magic.sqlite3"
+        try:
+            os.symlink(other_dir / "shopping-magic.sqlite3", link_db)
+        except OSError as exc:
+            self.skipTest(f"File symlink creation unavailable in this environment: {exc}")
+        target_store = shopping_store.Store(link_dir)
+        for action in ({"action": "storage-info"}, {"action": "context"}):
+            with self.assertRaisesRegex(shopping_store.StoreError, "redirected_profile_path"):
+                target_store.handle(action)
+
 
 if __name__ == "__main__":
     unittest.main()

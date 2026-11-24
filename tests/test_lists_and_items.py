@@ -204,6 +204,62 @@ class ListsAndItemsTests(unittest.TestCase):
                 "name": "Unseen Product",
             })
 
+    def test_reopening_bought_item_restores_remaining_quantity(self) -> None:
+        milk = self.store.handle({
+            "action": "item-add",
+            "request_key": "reopen-1",
+            "name": "Milk",
+            "list_name": "Supermarket",
+            "quantity": "6",
+            "unit": "bottles",
+        })["result"]
+        bought = self.store.handle({
+            "action": "item-update",
+            "id": milk["id"],
+            "expected_revision": 1,
+            "request_key": "reopen-buy",
+            "status": "bought",
+        })["result"]
+        self.assertEqual(bought["remaining_quantity"], "0")
+
+        reopened = self.store.handle({
+            "action": "item-update",
+            "id": milk["id"],
+            "expected_revision": bought["revision"],
+            "request_key": "reopen-need",
+            "status": "needed",
+        })["result"]
+        self.assertEqual(reopened["remaining_quantity"], "6")
+        self.assertIsNone(reopened["resolved_at"])
+
+        # Reopening directly to partially_bought requires an explicit positive remaining_quantity.
+        bought_again = self.store.handle({
+            "action": "item-update",
+            "id": milk["id"],
+            "expected_revision": reopened["revision"],
+            "request_key": "reopen-buy2",
+            "status": "bought",
+        })["result"]
+        with self.assertRaisesRegex(shopping_store.StoreError, "invalid_remaining_quantity"):
+            self.store.handle({
+                "action": "item-update",
+                "id": milk["id"],
+                "expected_revision": bought_again["revision"],
+                "request_key": "reopen-partial-bad",
+                "status": "partially_bought",
+            })
+
+        # Reopening with a new quantity sets remaining_quantity to that new quantity.
+        reopened_new_qty = self.store.handle({
+            "action": "item-update",
+            "id": milk["id"],
+            "expected_revision": bought_again["revision"],
+            "request_key": "reopen-new-qty",
+            "status": "needed",
+            "quantity": "4",
+        })["result"]
+        self.assertEqual(reopened_new_qty["remaining_quantity"], "4")
+
 
 if __name__ == "__main__":
     unittest.main()

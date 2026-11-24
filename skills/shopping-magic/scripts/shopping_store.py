@@ -686,7 +686,7 @@ def validate_snapshot(data: Any) -> dict[str, Any]:
 
     product_names: set[str] = set()
     for row in data["products"]:
-        name = check_str(row["name"], 200)
+        name = check_str(row["name"], 500)
         norm = normalized(name)
         if norm in product_names:
             raise StoreError("invalid_import_duplicate_product")
@@ -761,6 +761,7 @@ def validate_snapshot(data: Any) -> dict[str, Any]:
 
 def _validate_existing_database(path: Path) -> None:
     """Verify an existing SQLite file is a valid Shopping Magic store before trusting it."""
+    checked_path(path)
     if not path.is_file() or not _valid_sqlite_header(path):
         raise StoreError("unrecognized_database")
     try:
@@ -863,6 +864,7 @@ class Store:
     def _storage_info(self) -> dict[str, Any]:
         """Return read-only storage diagnostics without creating files or directories."""
         checked_path(self.data_dir)
+        checked_path(self.path)
         marker = self.data_dir / ".origins.json"
         profile_id = None
         if marker.exists():
@@ -894,6 +896,7 @@ class Store:
 
     def _connect(self, *, use_wal: bool = True) -> sqlite3.Connection:
         self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        checked_path(self.path)
         if self.path.exists():
             if not self.path.is_file() or not _valid_sqlite_header(self.path):
                 raise StoreError("unrecognized_database")
@@ -1435,7 +1438,7 @@ class Store:
         ]
 
     def _product_save(self, con: sqlite3.Connection, req: dict[str, Any]) -> dict[str, Any]:
-        name = text_field(req, "name", limit=200)
+        name = text_field(req, "name", limit=500)
         norm = normalized(name)
         previous = None
         if "id" in req:
@@ -1892,7 +1895,11 @@ class Store:
         elif "quantity" in payload:
             if qty is None:
                 rem = None
-            elif current["quantity"] is not None and current["remaining_quantity"] is not None:
+            elif (
+                current["status"] in ITEM_OPEN_STATUSES
+                and current["quantity"] is not None
+                and current["remaining_quantity"] is not None
+            ):
                 already_bought = Decimal(current["quantity"]) - Decimal(current["remaining_quantity"])
                 new_rem = max(Decimal("0"), Decimal(qty) - max(Decimal("0"), already_bought))
                 rem = format_decimal(new_rem)
@@ -1902,6 +1909,21 @@ class Store:
                 rem = qty
         else:
             rem = current["remaining_quantity"]
+
+        if (
+            current["status"] in ("bought", "cancelled")
+            and status in ITEM_OPEN_STATUSES
+            and "remaining_quantity" not in payload
+            and "quantity" not in payload
+            and qty is not None
+            and (rem is None or Decimal(rem) <= Decimal("0"))
+        ):
+            if status == "partially_bought":
+                raise StoreError("invalid_remaining_quantity")
+            rem = qty
+
+        if rem is not None and status in ITEM_OPEN_STATUSES and Decimal(rem) <= Decimal("0"):
+            raise StoreError("invalid_remaining_quantity")
 
         stamp = now()
         resolved_at = current["resolved_at"]
@@ -2436,7 +2458,7 @@ class Store:
         note = optional_text(req, "note", "", limit=2000)
 
         product_id = text_field(req, "product_id", limit=200) if req.get("product_id") is not None else None
-        product_name = text_field(req, "product_name", limit=200) if req.get("product_name") is not None else None
+        product_name = text_field(req, "product_name", limit=500) if req.get("product_name") is not None else None
         if product_id is None and product_name is None:
             raise StoreError("product_required")
 
