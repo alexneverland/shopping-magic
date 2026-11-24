@@ -4,7 +4,7 @@ A local-first AI shopping assistant skill for **OpenAI Codex CLI**, **Claude Cod
 
 Talk to your agent naturally — *"We're out of feta"*, *"Add four E27 light bulbs"*, *"I needed six bottles of milk, bought four"*, *"I need a birthday present for George by December 15, around €30"*, or *"When did I last buy coffee?"* — while a zero-dependency Python standard-library SQLite engine stores your lists, purchase history, gift plans, and replenishment cycles on your own computer.
 
-**Source version 0.1.1** · [Download the latest release (ZIP and SHA-256)](https://github.com/alexneverland/shopping-magic/releases/latest) · [All releases](https://github.com/alexneverland/shopping-magic/releases) · [Verification record](VERIFICATION.md)
+**Source version 0.1.2** · [Download the latest release (ZIP and SHA-256)](https://github.com/alexneverland/shopping-magic/releases/latest) · [All releases](https://github.com/alexneverland/shopping-magic/releases) · [Verification record](VERIFICATION.md)
 
 ## Why Shopping Magic exists
 
@@ -76,7 +76,7 @@ Shopping Magic does not hardcode a brittle keyword dictionary in Python. Instead
 
 ## How replenishment works
 
-1. **Explicit rules first:** If you say *"I'll need coffee again in a week"* or *"I change the water filter every 3 months"*, Shopping Magic stores `interval_days` or `calendar_months` on the product and calculates the next expected date from your latest purchase.
+1. **Explicit rules first:** Save a fixed interval such as three months for a filter or a duration per quantity such as seven days for 400 g of kasseri. A later purchase of 800 g projects 14 days from the purchase date. You can also give a date that applies only to the latest purchase.
 2. **History-based estimates:** When no explicit schedule is set and at least two purchase intervals (or explicit cycle feedback) exist, `replenishment-suggestions` computes an outlier-resistant median interval and marks `confidence` (`high`, `medium`, `low`) and `regularity`.
 3. **One-cycle feedback:** Telling the agent *"that coffee lasted 12 days this time"* updates that specific purchase's `actual_duration_days` without silently overwriting your explicit long-term rule.
 4. **Strict separation:** Predictions always carry `is_estimate: true` and are never silently converted into confirmed shopping list items or false purchases.
@@ -166,9 +166,9 @@ On Windows without an override, `.origins.json` records the shared profile's ID 
 
 - **Complete backup:** Close all agents using Shopping Magic and copy the entire data directory (both `shopping-magic.sqlite3` and `.origins.json` on Windows). To restore, close all agents and copy the directory back (or point `--data-dir` / `SHOPPING_MAGIC_DATA_DIR` at the restored copy).
 - **Portable JSON export/import:**
-  - `{"action":"export"}` emits a portable `schema_version: 2` JSON snapshot of lists, products, category preferences, shopping items, and purchases, including recorded purchase fulfillment. Retry receipts are excluded.
-  - `{"action":"import","request_key":"...","data":<export result>}` atomically restores a version 1 or version 2 snapshot into an **empty** destination profile (`import_requires_empty_profile` refuses non-empty targets).
-  - Existing SQLite profiles migrate automatically to schema 2. Update every host sharing the profile before using it with 0.1.1. Purchases created under schema 1 need an explicit review before a linked quantity correction or deletion.
+  - `{"action":"export"}` emits a portable `schema_version: 3` JSON snapshot, including purchase fulfillment and the quantity basis of replenishment rules. Retry receipts are excluded.
+  - `{"action":"import","request_key":"...","data":<export result>}` atomically restores a version 1, 2, or 3 snapshot into an **empty** destination profile (`import_requires_empty_profile` refuses non-empty targets).
+  - Existing SQLite profiles migrate automatically to schema 3. Update every host sharing the profile before using it with 0.1.2. Purchases created under schema 1 need an explicit review before a linked quantity correction or deletion.
 
 ## Running tests
 

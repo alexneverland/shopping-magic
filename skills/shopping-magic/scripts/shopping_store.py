@@ -7,6 +7,7 @@ import calendar
 from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 import hashlib
 import json
 import math
@@ -21,8 +22,8 @@ from typing import Any, Callable
 import unicodedata
 import uuid
 
-VERSION = "0.1.1"
-SCHEMA_VERSION = 2
+VERSION = "0.1.2"
+SCHEMA_VERSION = 3
 
 LIST_KINDS = ("supermarket", "home", "gifts", "pharmacy", "personal_care", "custom")
 PRIORITIES = ("low", "normal", "high", "urgent")
@@ -436,6 +437,23 @@ def convert_quantity(qty: Decimal, from_unit: str, to_unit: str) -> Decimal:
     return (qty * from_factor) / to_factor
 
 
+def quantity_replenishment_date(
+    product: sqlite3.Row | dict[str, Any], bought_on: date, quantity: str | None, unit: str
+) -> date | None:
+    if quantity is None:
+        return None
+    purchase_group, purchase_factor = unit_spec(unit or "piece")
+    basis_group, basis_factor = unit_spec(product["replenishment_basis_unit"] or "piece")
+    if purchase_group != basis_group:
+        return None
+    bought = Fraction(Decimal(quantity)) * Fraction(purchase_factor)
+    basis = Fraction(Decimal(product["replenishment_basis_quantity"])) * Fraction(basis_factor)
+    days = math.ceil(product["replenishment_value"] * bought / basis)
+    if days > (date.max - bought_on).days:
+        return None
+    return bought_on + timedelta(days=days)
+
+
 def add_months(start: date, months: int) -> date:
     total_months = (start.year * 12 + (start.month - 1)) + months
     year, zero_month = divmod(total_months, 12)
@@ -496,7 +514,9 @@ SCHEMA = (
     "replenishment_source TEXT NOT NULL DEFAULT 'none' CHECK(replenishment_source IN ('none','user_explicit','user_corrected')), "
     "revision INTEGER NOT NULL DEFAULT 1, "
     "created_at TEXT NOT NULL, "
-    "updated_at TEXT NOT NULL"
+    "updated_at TEXT NOT NULL, "
+    "replenishment_basis_quantity TEXT, "
+    "replenishment_basis_unit TEXT NOT NULL DEFAULT ''"
     ")",
     "CREATE TABLE category_preferences ("
     "id TEXT PRIMARY KEY, "
@@ -577,7 +597,15 @@ def migrate_purchase_fulfillment(con: sqlite3.Connection) -> None:
     con.execute("ALTER TABLE purchases ADD COLUMN fulfillment TEXT")
 
 
-MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {1: migrate_purchase_fulfillment}
+def migrate_replenishment_basis(con: sqlite3.Connection) -> None:
+    con.execute("ALTER TABLE products ADD COLUMN replenishment_basis_quantity TEXT")
+    con.execute("ALTER TABLE products ADD COLUMN replenishment_basis_unit TEXT NOT NULL DEFAULT ''")
+
+
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    1: migrate_purchase_fulfillment,
+    2: migrate_replenishment_basis,
+}
 
 
 def validate_snapshot(data: Any) -> dict[str, Any]:
@@ -638,7 +666,7 @@ def validate_snapshot(data: Any) -> dict[str, Any]:
         parse_decimal(value, "import_decimal", allow_zero=allow_zero)
 
     check_fields(data, {"schema_version", *EXPORT_TABLES})
-    if type(data["schema_version"]) is not int or data["schema_version"] not in (1, 2):
+    if type(data["schema_version"]) is not int or data["schema_version"] not in (1, 2, 3):
         raise StoreError("unsupported_import_schema")
 
     shapes = {
@@ -662,8 +690,10 @@ def validate_snapshot(data: Any) -> dict[str, Any]:
             "expected_next_on", "finished_on", "actual_duration_days", "created_at", "updated_at",
         },
     }
-    if data["schema_version"] == 2:
+    if data["schema_version"] >= 2:
         shapes["purchases"].add("fulfillment")
+    if data["schema_version"] >= 3:
+        shapes["products"].update(("replenishment_basis_quantity", "replenishment_basis_unit"))
 
     ids: dict[str, set[str]] = {}
     for table in EXPORT_TABLES:
@@ -711,6 +741,14 @@ def validate_snapshot(data: Any) -> dict[str, Any]:
                 raise StoreError("invalid_import_replenishment")
         else:
             check_int(row["replenishment_value"], minimum=1, nullable=False)
+        basis_quantity = row.get("replenishment_basis_quantity")
+        basis_unit = check_str(row.get("replenishment_basis_unit", ""), 200, empty=True)
+        if basis_quantity is not None:
+            check_dec(basis_quantity)
+            if row["replenishment_mode"] != "interval_days":
+                raise StoreError("invalid_import_replenishment")
+        elif basis_unit:
+            raise StoreError("invalid_import_replenishment")
         check_str(row["replenishment_note"], 2000, empty=True)
         check_int(row["revision"], minimum=1)
 
@@ -1088,7 +1126,8 @@ class Store:
             ),
             "replenishment-set": (
                 self._replenishment_set,
-                {"product_id", "product_name", "mode", "value", "note", "source", "request_key"},
+                {"product_id", "product_name", "mode", "value", "basis_quantity", "basis_unit",
+                 "note", "source", "request_key"},
             ),
             "replenishment-suggestions": (
                 self._replenishment_suggestions,
@@ -1196,6 +1235,8 @@ class Store:
             "replenishment_value": row["replenishment_value"],
             "replenishment_note": row["replenishment_note"],
             "replenishment_source": row["replenishment_source"],
+            "replenishment_basis_quantity": row["replenishment_basis_quantity"],
+            "replenishment_basis_unit": row["replenishment_basis_unit"],
             "revision": row["revision"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -2277,6 +2318,7 @@ class Store:
             rep_val = rep_days if rep_days is not None else rep_months
             con.execute(
                 "UPDATE products SET replenishment_mode=?, replenishment_value=?, replenishment_note=?, "
+                "replenishment_basis_quantity=NULL, replenishment_basis_unit='', "
                 "replenishment_source='user_explicit', revision=revision+1, updated_at=? WHERE id=?",
                 (rep_mode, rep_val, rep_note or product_row["replenishment_note"], stamp, product_row["id"]),
             )
@@ -2316,7 +2358,10 @@ class Store:
         if suggested_next_on is None:
             pmode = hydrated_product["replenishment_mode"]
             pval = hydrated_product["replenishment_value"]
-            if pmode == "interval_days" and pval is not None:
+            if hydrated_product["replenishment_basis_quantity"] is not None:
+                due = quantity_replenishment_date(hydrated_product, date.fromisoformat(bought_on), quantity, unit)
+                suggested_next_on = due.isoformat() if due is not None else None
+            elif pmode == "interval_days" and pval is not None:
                 suggested_next_on = (date.fromisoformat(bought_on) + timedelta(days=pval)).isoformat()
             elif pmode == "calendar_months" and pval is not None:
                 suggested_next_on = add_months(date.fromisoformat(bought_on), pval).isoformat()
@@ -2583,6 +2628,10 @@ class Store:
         mode = text_field(req, "mode", limit=50)
         if mode not in REPLENISHMENT_MODES:
             raise StoreError("invalid_replenishment_mode")
+        basis_quantity = optional_decimal(req, "basis_quantity")
+        basis_unit = optional_text(req, "basis_unit", "", limit=200)
+        if (basis_quantity is not None and mode != "interval_days") or (basis_unit and basis_quantity is None):
+            raise StoreError("invalid_replenishment_basis")
         if mode == "none":
             if req.get("value") is not None:
                 raise StoreError("invalid_replenishment_value")
@@ -2610,6 +2659,9 @@ class Store:
             "note": note,
             "source": source,
         }
+        # Preserve request hashes for rules created before quantity-based estimates.
+        if basis_quantity is not None:
+            payload.update(basis_quantity=basis_quantity, basis_unit=basis_unit)
         req_hash = None
         if key is not None:
             req_hash, replayed = self._replay_receipt(con, "replenishment-set", key, payload)
@@ -2625,8 +2677,9 @@ class Store:
 
         con.execute(
             "UPDATE products SET replenishment_mode=?, replenishment_value=?, replenishment_note=?, "
+            "replenishment_basis_quantity=?, replenishment_basis_unit=?, "
             "replenishment_source=?, revision=revision+1, updated_at=? WHERE id=?",
-            (mode, value, note, source, now(), product["id"]),
+            (mode, value, note, basis_quantity, basis_unit, source, now(), product["id"]),
         )
         hydrated = self._fetch_product_hydrated(con, product["id"])
         if key is not None and req_hash is not None:
@@ -2681,6 +2734,20 @@ class Store:
             regularity = "explicit"
             estimated_interval_days = (date.fromisoformat(suggested_next_on) - date.fromisoformat(last_bought_on)).days
             explanation = f"Explicit expectation set on purchase from {last_bought_on}."
+        elif product["replenishment_basis_quantity"] is not None:
+            basis = "explicit_quantity_interval"
+            confidence = "explicit"
+            regularity = "explicit"
+            explanation = "User-defined duration per quantity saved; awaiting first purchase date."
+            if last_purchase is not None:
+                last_dt = date.fromisoformat(last_bought_on)
+                next_dt = quantity_replenishment_date(product, last_dt, last_purchase["quantity"], last_purchase["unit"])
+                if next_dt is None:
+                    explanation = "Purchase quantity, unit, or date is unsuitable for the saved quantity rule."
+                else:
+                    suggested_next_on = next_dt.isoformat()
+                    estimated_interval_days = (next_dt - last_dt).days
+                    explanation = f"User-defined duration scaled to the quantity purchased on {last_bought_on}."
         elif mode in ("interval_days", "calendar_months"):
             confidence = "explicit"
             regularity = "explicit"
@@ -2753,6 +2820,8 @@ class Store:
                 status = "ok"
         elif mode != "none" and not purchases:
             status = "awaiting_purchase_history"
+        elif basis == "explicit_quantity_interval":
+            status = "quantity_estimate_unavailable"
         elif purchases:
             status = "insufficient_history"
         else:
@@ -2778,6 +2847,8 @@ class Store:
             "latest_feedback_days": latest_feedback_days,
             "replenishment_mode": mode,
             "replenishment_value": value,
+            "replenishment_basis_quantity": product["replenishment_basis_quantity"],
+            "replenishment_basis_unit": product["replenishment_basis_unit"],
             "replenishment_note": product["replenishment_note"],
             "confirmed_need_exists": open_item_count > 0,
             "open_item_count": open_item_count,
@@ -2865,6 +2936,7 @@ class Store:
             "due_soon_estimate": 1,
             "ok": 2,
             "awaiting_purchase_history": 3,
+            "quantity_estimate_unavailable": 4,
             "insufficient_history": 4,
             "no_pattern": 5,
         }
@@ -3039,7 +3111,7 @@ class Store:
                 row["name"], row["aliases"], row["default_brand"], row["default_category"], row["notes"]
             )
             con.execute(
-                "INSERT INTO products VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO products VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     row["id"], row["name"], normalized(row["name"]),
                     json.dumps(row["aliases"], ensure_ascii=False), search_text,
@@ -3048,6 +3120,7 @@ class Store:
                     row["replenishment_mode"], row["replenishment_value"],
                     row["replenishment_note"], row["replenishment_source"],
                     row["revision"], row["created_at"], row["updated_at"],
+                    row.get("replenishment_basis_quantity"), row.get("replenishment_basis_unit", ""),
                 ),
             )
         for row in data["category_preferences"]:

@@ -193,6 +193,74 @@ class ReplenishmentTests(unittest.TestCase):
         self.assertEqual(len(ctx["replenishment_suggestions"]), 1)
         self.assertEqual(ctx["replenishment_suggestions"][0]["status"], "overdue_estimate")
 
+    def test_replenishment_scales_explicit_duration_by_purchase_quantity(self) -> None:
+        rule = {
+            "action": "replenishment-set", "request_key": "set-units", "product_name": "Soap",
+            "mode": "interval_days", "value": 7, "basis_quantity": "1", "basis_unit": "piece",
+        }
+        self.assertEqual(self.store.handle(rule), self.store.handle(rule))
+        purchase = self.store.handle({
+            "action": "purchase-log", "request_key": "buy-five", "product_name": "Soap",
+            "bought_on": "2026-11-24", "quantity": "5",
+        })["result"]
+        self.assertEqual(purchase["suggested_next_on"], "2026-12-29")
+        query = {"action": "replenishment-suggestions", "query": "Soap", "as_of": "2026-11-24"}
+        suggestion = self.store.handle(query)["result"]["suggestions"][0]
+        self.assertEqual(suggestion["basis"], "explicit_quantity_interval")
+        self.assertEqual(suggestion["estimated_interval_days"], 35)
+        self.assertEqual(suggestion["suggested_next_on"], purchase["suggested_next_on"])
+        self.assertTrue(suggestion["is_estimate"])
+
+        snapshot = self.store.handle({"action": "export"})["result"]
+        with tempfile.TemporaryDirectory(prefix="sm-scaled-restore-") as restored:
+            target = shopping_store.Store(Path(restored))
+            target.handle({"action": "import", "request_key": "restore", "data": snapshot})
+            self.assertEqual(target.handle(query)["result"]["suggestions"][0], suggestion)
+        self.store.handle({
+            "action": "purchase-update", "request_key": "correct-count",
+            "id": purchase["purchase"]["id"], "quantity": "3",
+        })
+        corrected = self.store.handle(query)["result"]["suggestions"][0]
+        self.assertEqual(corrected["estimated_interval_days"], 21)
+        self.assertEqual(corrected["suggested_next_on"], "2026-12-15")
+
+    def test_quantity_rule_handles_compatible_and_unknown_units(self) -> None:
+        self.store.handle({
+            "action": "replenishment-set", "product_name": "Kasseri", "mode": "interval_days",
+            "value": 7, "basis_quantity": "400", "basis_unit": "g",
+        })
+        for index, (quantity, unit, due) in enumerate((
+            ("0.8", "kg", "2026-12-08"),
+            ("100", "g", "2026-11-26"),
+            ("2", "packs", None),
+            ("800", "", None),
+            (None, "g", None),
+        )):
+            with self.subTest(quantity=quantity, unit=unit):
+                recorded = self.store.handle({
+                    "action": "purchase-log", "request_key": f"quantity-{index}", "product_name": "Kasseri",
+                    "bought_on": "2026-11-24", "quantity": quantity, "unit": unit,
+                })["result"]
+                self.assertEqual(recorded["suggested_next_on"], due)
+                suggestion = self.store.handle({
+                    "action": "replenishment-suggestions", "query": "Kasseri", "as_of": "2026-11-24",
+                })["result"]["suggestions"][0]
+                self.assertEqual(suggestion["suggested_next_on"], due)
+                if due is None:
+                    self.assertEqual(suggestion["status"], "quantity_estimate_unavailable")
+
+    def test_quantity_rule_can_be_replaced_with_a_fixed_interval(self) -> None:
+        rule = {"action": "replenishment-set", "product_name": "Soap", "mode": "interval_days", "value": 7}
+        with self.assertRaisesRegex(shopping_store.StoreError, "invalid_replenishment_basis"):
+            self.store.handle(dict(rule, mode="calendar_months", basis_quantity="1"))
+        self.store.handle(dict(rule, basis_quantity="1"))
+        self.store.handle(rule)
+        result = self.store.handle({
+            "action": "purchase-log", "request_key": "after-fixed", "product_name": "Soap",
+            "bought_on": "2026-11-24", "quantity": "5",
+        })["result"]
+        self.assertEqual(result["suggested_next_on"], "2026-12-01")
+
 
 if __name__ == "__main__":
     unittest.main()

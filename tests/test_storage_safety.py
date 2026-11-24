@@ -90,7 +90,12 @@ class StorageSafetyTests(unittest.TestCase):
     def test_transactional_migration_and_rollback_on_failure(self) -> None:
         data_dir = self.base / "migrate"
         store = shopping_store.Store(data_dir)
-        legacy_schema = tuple(statement.replace(", fulfillment TEXT", "") for statement in shopping_store.SCHEMA)
+        legacy_schema = tuple(
+            statement.replace(", fulfillment TEXT", "")
+            .replace(", replenishment_basis_quantity TEXT", "")
+            .replace(", replenishment_basis_unit TEXT NOT NULL DEFAULT ''", "")
+            for statement in shopping_store.SCHEMA
+        )
         request = {
             "action": "item-add", "request_key": "mig-1", "name": "Olive Oil",
             "list_name": "Supermarket", "list_kind": "supermarket",
@@ -121,8 +126,9 @@ class StorageSafetyTests(unittest.TestCase):
         self.assertEqual(store.handle(request)["result"], item)
         con = sqlite3.connect(data_dir / "shopping-magic.sqlite3")
         try:
-            self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 3)
             self.assertIn("fulfillment", {r[1] for r in con.execute("PRAGMA table_info(purchases)")})
+            self.assertIn("replenishment_basis_quantity", {r[1] for r in con.execute("PRAGMA table_info(products)")})
         finally:
             con.close()
 

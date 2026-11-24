@@ -30,13 +30,28 @@ restock suggestions.
 
 When the user states how long a consumable lasts or how often they buy it:
 
-- *"I bought coffee today. I'll need it again in a week."* → call `purchase-log`
-  with `bought_on`, `replenishment_days: 7` (which saves `interval_days: 7` on
-  the product and sets `expected_next_on` 7 days later).
+- *"I bought coffee today. This pack will last a week."* → call `purchase-log`
+  with the purchase date and `expected_next_on` seven days later for this purchase.
 - *"I change the water filter every three months."* → call `replenishment-set`
   with `mode: "calendar_months"`, `value: 3`, `source: "user_explicit"`.
 - *"We usually buy toilet paper every two weeks."* → `mode: "interval_days"`,
   `value: 14`, `source: "user_explicit"`.
+- *"Usually one bar of soap lasts me a week."* → use `replenishment-set` with
+  `mode: "interval_days"`, `value: 7`, `basis_quantity: "1"`, and
+  `basis_unit: "piece"`. When the user later buys five, record `quantity: "5"`
+  and use the store's estimate of 35 days from that purchase. A count supplied
+  without a unit also works with a piece-based rule.
+- *"Usually 400 grams of kasseri lasts me a week."* → use `basis_quantity: "400"`
+  and `basis_unit: "g"`. After a purchase of `0.8 kg`, the estimate is
+  14 days. When a message includes a purchase and a new standing rule, record
+  the purchase, save the rule on its product, then fetch the updated estimate.
+
+A quantity-based rule projects the duration of the latest purchase at the saved
+rate, rounding a fraction of a day up. A date given for that specific purchase
+takes precedence. When the purchase has no quantity or its unit is incompatible,
+the helper returns no date (`quantity_estimate_unavailable`). Ask for the
+quantity or comparable unit if the user needs a date. An earlier stock balance
+and package-to-weight conversions are outside this calculation.
 
 ## 3. History-based estimation & transparency
 
