@@ -243,6 +243,9 @@ class PurchasesAndHistoryTests(unittest.TestCase):
 
         snapshot["schema_version"] = 1
         del snapshot["purchases"][0]["fulfillment"]
+        for product in snapshot["products"]:
+            del product["replenishment_basis_quantity"]
+            del product["replenishment_basis_unit"]
         legacy = shopping_store.Store(Path(self.tmp.name) / "legacy")
         legacy.handle({"action": "import", "request_key": "import", "data": snapshot})
         with self.assertRaisesRegex(shopping_store.StoreError, "purchase_item_state_requires_review"):

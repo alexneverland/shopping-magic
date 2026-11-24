@@ -84,9 +84,9 @@ the database or replaying receipts.
 | `purchase-list` | — | `product_id`, `query`, `store`, `list_id`, `list_name`, `category`, `on`, `from_date`, `to_date`, `limit` (1–100, default 50), `offset` | Purchase history newest first |
 | `purchase-remove` | `id`, `request_key`, `confirm` (`true`) | `keep_item_state` | Removed purchase record |
 | `spending-summary` | — | `store`, `list_id`, `list_name`, `category`, `product_id`, `on`, `from_date`, `to_date` | Exact currency totals, store breakdown, `is_complete` flag |
-| `replenishment-set` | `mode` (`none`/`interval_days`/`calendar_months`), plus `product_id` or `product_name` | `value` (int >= 1 when mode != `none`), `note`, `source` (`user_explicit`/`user_corrected`), `request_key` | Updated product replenishment rule |
+| `replenishment-set` | `mode` (`none`/`interval_days`/`calendar_months`), plus `product_id` or `product_name` | `value` (int >= 1 when mode != `none`), `basis_quantity`, `basis_unit`, `note`, `source` (`user_explicit`/`user_corrected`), `request_key` | Updated product replenishment rule |
 | `replenishment-suggestions` | — | `as_of`, `horizon_days` (1–365, default 14), `product_id`, `query`, `list_id`, `list_name`, `include_all` (bool) | Read-only replenishment estimates (`is_estimate: true`) |
-| `export` | — | — | Portable JSON snapshot (`schema_version: 2`), omitting `mutation_requests` |
+| `export` | — | — | Portable JSON snapshot (`schema_version: 3`), omitting `mutation_requests` |
 | `import` | `data`, `request_key` | — | Atomic snapshot restore into an empty profile only |
 
 ## Validation, types, and idempotency
@@ -136,14 +136,21 @@ the database or replaying receipts.
   decides to change history while preserving the current list item, retry
   with `keep_item_state: true`. Quantity and unit changes on a purchase
   recorded with `mark_bought` or `keep_open` preserve that decision.
+- **Quantity-based replenishment:** In `interval_days` mode, a positive
+  `basis_quantity` makes `value` the number of days for that quantity.
+  `basis_unit` uses compatible measurement units or a piece count when blank.
+  The latest purchase quantity scales the duration, rounded up to a whole day.
+  A missing quantity or incompatible unit yields no date.
+  Saving a rule without a basis replaces it with a fixed interval.
 
 ## Export and import
 
 `export` emits all active domain tables (`lists`, `products`,
 `category_preferences`, `shopping_items`, `purchases`) without `mutation_requests`.
-Schema 2 snapshots preserve purchase fulfillment metadata. Schema 1 snapshots
-can still be imported. Existing SQLite databases migrate to schema 2 on use,
-preserving purchases and retry receipts. Legacy linked purchases have no
+Schema 3 snapshots preserve purchase fulfillment metadata and the quantity
+basis of replenishment rules. Schema 1 and 2 snapshots can still be imported.
+Existing SQLite databases migrate to schema 3 on use, preserving purchases
+and retry receipts. Legacy linked purchases have no
 fulfillment metadata, so corrections that would affect the list require review.
 `import` requires a completely empty destination profile (no rows in any domain
 table or `mutation_requests`), failing with `import_requires_empty_profile`
