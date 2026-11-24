@@ -80,13 +80,13 @@ the database or replaying receipts.
 | `item-remove` | `id`, `request_key` | `expected_revision` | Removed item (`purchases` preserved) |
 | `list-clear` | `request_key`, `confirm` (`true`), plus `list_id` or `list_name` | `statuses` (list of statuses; default open statuses) | Removed item count; preserves purchases |
 | `purchase-log` | `bought_on` (`YYYY-MM-DD`), `request_key`, plus `item_id` or `product_id` or `product_name` | `expected_item_revision`, `list_id`, `list_name`, `list_kind`, `category`, `quantity`, `unit`, `brand`, `store`, `price`, `currency`, `notes`, `fulfillment_mode` (`auto`/`mark_bought`/`keep_open`), `expected_next_on` (purchase-specific override), `replenishment_days`, `replenishment_months`, `replenishment_note` | Recorded purchase + optional `updated_item` + `product` + `suggested_next_on` |
-| `purchase-update` | `id`, `request_key` (plus at least one updatable field) | `bought_on`, `quantity`, `unit`, `brand`, `store`, `price`, `currency`, `notes`, `expected_next_on`, `finished_on`, `actual_duration_days` | Updated purchase / one-cycle duration feedback |
+| `purchase-update` | `id`, `request_key` (plus at least one updatable field) | `bought_on`, `quantity`, `unit`, `brand`, `store`, `price`, `currency`, `notes`, `expected_next_on`, `finished_on`, `actual_duration_days`, `keep_item_state` | Updated purchase / one-cycle duration feedback |
 | `purchase-list` | — | `product_id`, `query`, `store`, `list_id`, `list_name`, `category`, `on`, `from_date`, `to_date`, `limit` (1–100, default 50), `offset` | Purchase history newest first |
-| `purchase-remove` | `id`, `request_key`, `confirm` (`true`) | — | Removed purchase record |
+| `purchase-remove` | `id`, `request_key`, `confirm` (`true`) | `keep_item_state` | Removed purchase record |
 | `spending-summary` | — | `store`, `list_id`, `list_name`, `category`, `product_id`, `on`, `from_date`, `to_date` | Exact currency totals, store breakdown, `is_complete` flag |
 | `replenishment-set` | `mode` (`none`/`interval_days`/`calendar_months`), plus `product_id` or `product_name` | `value` (int >= 1 when mode != `none`), `note`, `source` (`user_explicit`/`user_corrected`), `request_key` | Updated product replenishment rule |
 | `replenishment-suggestions` | — | `as_of`, `horizon_days` (1–365, default 14), `product_id`, `query`, `list_id`, `list_name`, `include_all` (bool) | Read-only replenishment estimates (`is_estimate: true`) |
-| `export` | — | — | Full portable JSON snapshot (`schema_version: 1`), omitting `mutation_requests` |
+| `export` | — | — | Portable JSON snapshot (`schema_version: 2`), omitting `mutation_requests` |
 | `import` | `data`, `request_key` | — | Atomic snapshot restore into an empty profile only |
 
 ## Validation, types, and idempotency
@@ -119,11 +119,32 @@ the database or replaying receipts.
   roll back the entire transaction and return `incompatible_units`. Use
   `fulfillment_mode="mark_bought"` when the user confirms an item is fully
   covered despite a different unit.
+- **Unit-only item edits:** When changing the unit of a quantified item without
+  supplying a new quantity, the helper converts both stored quantities. An
+  incompatible unit fails with `incompatible_units`. An explicit
+  `remaining_quantity` is always interpreted in the requested unit.
+- **Purchase identity and store:** When supplied together, `item_id`,
+  `product_id`, and `product_name` must identify the same product, including
+  recognized aliases. A mismatch returns `purchase_product_mismatch`.
+  Purchase `store` is empty when omitted. A list item's `preferred_store`
+  never supplies the actual store used for spending totals.
+- **Linked purchase corrections:** A quantity or unit change on an automatic
+  fulfillment reapplies the purchase to the original remaining quantity. A
+  removal restores the prior status and remainder. These changes are atomic
+  and require evidence that the linked item revision still matches. Otherwise,
+  the CLI returns `purchase_item_state_requires_review`. After the user
+  decides to change history while preserving the current list item, retry
+  with `keep_item_state: true`. Quantity and unit changes on a purchase
+  recorded with `mark_bought` or `keep_open` preserve that decision.
 
 ## Export and import
 
 `export` emits all active domain tables (`lists`, `products`,
 `category_preferences`, `shopping_items`, `purchases`) without `mutation_requests`.
+Schema 2 snapshots preserve purchase fulfillment metadata. Schema 1 snapshots
+can still be imported. Existing SQLite databases migrate to schema 2 on use,
+preserving purchases and retry receipts. Legacy linked purchases have no
+fulfillment metadata, so corrections that would affect the list require review.
 `import` requires a completely empty destination profile (no rows in any domain
 table or `mutation_requests`), failing with `import_requires_empty_profile`
 otherwise. For a complete byte-exact backup including retry receipts, close all

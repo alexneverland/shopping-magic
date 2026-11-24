@@ -88,6 +88,17 @@ When the user reports actual purchases:
   user bought `250 g`), ask or verify whether the purchase satisfied the whole
   item, and if confirmed, pass `fulfillment_mode: "mark_bought"` (or adjust
   remaining quantity via `item-update`).
+- When the purchase location is missing, leave `store` empty even if the item
+  has a preferred store. If you provide both item and product identifiers,
+  use the same product. On `purchase_product_mismatch`, reload the records
+  before retrying with the correct identifiers.
+- When the user corrects a purchase quantity or confirms deletion of a purchase,
+  use `purchase-update` or `purchase-remove`. The CLI updates the linked
+  remainder when it can verify the prior item state. On
+  `purchase_item_state_requires_review`, show the current remainder and ask
+  what should remain on the list. Use `keep_item_state: true` for a confirmed
+  history-only change. If the user also gives a new remainder, apply it with
+  `item-update` and the current `expected_revision`.
 
 ## 5. Purchase history & spending questions
 
