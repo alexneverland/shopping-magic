@@ -4,7 +4,7 @@ A local-first AI shopping assistant skill for **OpenAI Codex CLI**, **Claude Cod
 
 Talk to your agent naturally — *"We're out of feta"*, *"Add four E27 light bulbs"*, *"I needed six bottles of milk, bought four"*, *"I need a birthday present for George by December 15, around €30"*, or *"When did I last buy coffee?"* — while a zero-dependency Python standard-library SQLite engine stores your lists, purchase history, gift plans, and replenishment cycles on your own computer.
 
-**Version 0.1.0** · [Download the latest release (ZIP and SHA-256)](https://github.com/alexneverland/shopping-magic/releases/latest) · [All releases](https://github.com/alexneverland/shopping-magic/releases) · [Verification record](VERIFICATION.md)
+**Source version 0.1.1** · [Download the latest release (ZIP and SHA-256)](https://github.com/alexneverland/shopping-magic/releases/latest) · [All releases](https://github.com/alexneverland/shopping-magic/releases) · [Verification record](VERIFICATION.md)
 
 ## Why Shopping Magic exists
 
@@ -20,7 +20,7 @@ Shopping Magic splits responsibilities cleanly:
 - **Natural shopping lists:** Multiple named lists (`Supermarket`, `Home`, `Gifts`, `Pharmacy`, `Personal Care`, or any custom list), optional quantities/units, brands, preferred stores, priorities, target dates, and notes. Missing optional details never block adding an item.
 - **Automatic category inference & memory:** The agent infers the right list from context and remembers your corrections (e.g., *"No, put batteries under Home"*) via product defaults and topic routing preferences.
 - **Durable purchase history:** Logs actual purchases separately from shopping needs with dates, stores, quantities, and optional prices. Deleting a list item never erases past purchase history.
-- **Partial purchases & unit safety:** Buying 4 out of 6 needed bottles keeps 2 bottles open (`partially_bought`). Metric conversions (`kg` ↔ `g`, `l` ↔ `ml`) and singular/plural Greek/English unit forms work automatically; incompatible units (e.g., `bottles` vs `kg`) roll back cleanly instead of guessing.
+- **Partial purchases & unit safety:** Buying 4 out of 6 needed bottles keeps 2 bottles open (`partially_bought`). Compatible unit-only edits convert both quantities. Correcting or removing a linked purchase also corrects the list when its previous state can be verified. If the list has changed since the purchase, the agent asks how to handle the remaining need.
 - **Spending totals without guesswork:** Summarizes spending by currency and store, and explicitly flags incomplete totals whenever some purchases lack recorded prices.
 - **Gifts & dated purchases:** Tracks recipient, occasion, target date, approximate budget, and status (`idea` / `planned` / `needed` / `bought`), keeping planned gifts distinct from bought gifts and treating occasions as non-recurring unless stated otherwise.
 - **Intelligent replenishment:** Supports explicit intervals (*"every 7 days"*, *"every 3 months"*), outlier-resistant median estimates from purchase history, and one-off cycle feedback without silently overwriting your explicit long-term schedule. Predictions stay separate from confirmed open shopping lists.
@@ -166,8 +166,9 @@ On Windows without an override, `.origins.json` records the shared profile's ID 
 
 - **Complete backup:** Close all agents using Shopping Magic and copy the entire data directory (both `shopping-magic.sqlite3` and `.origins.json` on Windows). To restore, close all agents and copy the directory back (or point `--data-dir` / `SHOPPING_MAGIC_DATA_DIR` at the restored copy).
 - **Portable JSON export/import:**
-  - `{"action":"export"}` emits a portable `schema_version: 1` JSON snapshot of all lists, products, category preferences, shopping items, and purchases (excluding internal `mutation_requests` receipts).
-  - `{"action":"import","request_key":"...","data":<export result>}` atomically restores an exported snapshot into an **empty** destination profile (`import_requires_empty_profile` refuses non-empty targets).
+  - `{"action":"export"}` emits a portable `schema_version: 2` JSON snapshot of lists, products, category preferences, shopping items, and purchases, including recorded purchase fulfillment. Retry receipts are excluded.
+  - `{"action":"import","request_key":"...","data":<export result>}` atomically restores a version 1 or version 2 snapshot into an **empty** destination profile (`import_requires_empty_profile` refuses non-empty targets).
+  - Existing SQLite profiles migrate automatically to schema 2. Update every host sharing the profile before using it with 0.1.1. Purchases created under schema 1 need an explicit review before a linked quantity correction or deletion.
 
 ## Running tests
 

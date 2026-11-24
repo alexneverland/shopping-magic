@@ -90,13 +90,13 @@ class StorageSafetyTests(unittest.TestCase):
     def test_transactional_migration_and_rollback_on_failure(self) -> None:
         data_dir = self.base / "migrate"
         store = shopping_store.Store(data_dir)
-        item = store.handle({
-            "action": "item-add",
-            "request_key": "mig-1",
-            "name": "Olive Oil",
-            "list_name": "Supermarket",
-            "list_kind": "supermarket",
-        })["result"]
+        legacy_schema = tuple(statement.replace(", fulfillment TEXT", "") for statement in shopping_store.SCHEMA)
+        request = {
+            "action": "item-add", "request_key": "mig-1", "name": "Olive Oil",
+            "list_name": "Supermarket", "list_kind": "supermarket",
+        }
+        with patch.object(shopping_store, "SCHEMA_VERSION", 1), patch.object(shopping_store, "SCHEMA", legacy_schema):
+            item = store.handle(request)["result"]
 
         def failing_mig(con: sqlite3.Connection) -> None:
             con.execute("ALTER TABLE shopping_items ADD COLUMN temp_col TEXT NOT NULL DEFAULT ''")
@@ -116,20 +116,13 @@ class StorageSafetyTests(unittest.TestCase):
             self.assertNotIn("temp_col", cols)
         finally:
             con.close()
-        self.assertEqual(store.handle({"action": "item-get", "id": item["id"]})["result"]["name"], "Olive Oil")
-
-        # Now run a successful migration to schema 2.
-        def good_mig(con: sqlite3.Connection) -> None:
-            con.execute("ALTER TABLE shopping_items ADD COLUMN aisle_hint TEXT NOT NULL DEFAULT ''")
-
-        with patch.object(shopping_store, "SCHEMA_VERSION", 2), patch.object(
-            shopping_store, "MIGRATIONS", {1: good_mig}
-        ):
-            ctx = store.handle({"action": "context"})["result"]
+        ctx = store.handle({"action": "context"})["result"]
         self.assertEqual(ctx["open_items"][0]["id"], item["id"])
+        self.assertEqual(store.handle(request)["result"], item)
         con = sqlite3.connect(data_dir / "shopping-magic.sqlite3")
         try:
             self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertIn("fulfillment", {r[1] for r in con.execute("PRAGMA table_info(purchases)")})
         finally:
             con.close()
 

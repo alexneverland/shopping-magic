@@ -118,6 +118,146 @@ class PurchasesAndHistoryTests(unittest.TestCase):
         self.assertIsNone(result["purchase"]["quantity"])
         self.assertIsNone(result["purchase"]["price"])
 
+    def test_linked_purchase_rejects_a_different_product(self) -> None:
+        milk = self.store.handle({
+            "action": "item-add", "request_key": "milk", "name": "Milk", "list_name": "Audit",
+        })["result"]
+        tea = self.store.handle({"action": "product-save", "name": "Tea"})["result"]
+        for index, fields in enumerate(({"product_id": tea["id"]}, {"product_name": "Tea"})):
+            with self.subTest(fields=fields), self.assertRaisesRegex(shopping_store.StoreError, "purchase_product_mismatch"):
+                self.store.handle({
+                    "action": "purchase-log", "request_key": f"wrong-{index}", "bought_on": "2026-11-24",
+                    "item_id": milk["id"], **fields,
+                })
+        self.assertEqual(self.store.handle({"action": "purchase-list"})["result"], [])
+        self.assertEqual(self.store.handle({"action": "item-get", "id": milk["id"]})["result"]["status"], "needed")
+        product = self.store.handle({
+            "action": "product-save", "name": "Milk", "aliases": ["Dairy Milk"],
+        })["result"]
+        logged = self.store.handle({
+            "action": "purchase-log", "request_key": "alias", "bought_on": "2026-11-24",
+            "item_id": milk["id"], "product_id": product["id"], "product_name": "Dairy Milk",
+        })["result"]
+        self.assertEqual(logged["updated_item"]["status"], "bought")
+
+    def test_purchase_without_store_does_not_inherit_preferred_store(self) -> None:
+        milk = self.store.handle({
+            "action": "item-add", "request_key": "milk", "name": "Milk", "list_name": "Audit",
+            "preferred_store": "Market A",
+        })["result"]
+        logged = self.store.handle({
+            "action": "purchase-log", "request_key": "buy", "item_id": milk["id"],
+            "bought_on": "2026-11-24", "price": "5.20", "currency": "EUR",
+        })["result"]
+        self.assertEqual(logged["purchase"]["store"], "")
+        filtered = self.store.handle({"action": "spending-summary", "store": "Market A"})["result"]
+        self.assertEqual(filtered["purchase_count"], 0)
+        self.assertEqual(self.store.handle({"action": "spending-summary"})["result"]["totals_by_currency"], {"EUR": "5.2"})
+
+    def test_unit_only_edit_converts_total_and_remaining(self) -> None:
+        item = self.store.handle({
+            "action": "item-add", "request_key": "coffee", "name": "Coffee", "list_name": "Audit",
+            "quantity": "2", "unit": "kg",
+        })["result"]
+        item = self.store.handle({
+            "action": "purchase-log", "request_key": "buy", "item_id": item["id"],
+            "bought_on": "2026-11-24", "quantity": "500", "unit": "g",
+        })["result"]["updated_item"]
+        edit = {
+            "action": "item-update", "request_key": "unit", "id": item["id"],
+            "expected_revision": item["revision"],
+        }
+        with self.assertRaisesRegex(shopping_store.StoreError, "incompatible_units"):
+            self.store.handle(dict(edit, unit="bottles"))
+        updated = self.store.handle(dict(edit, unit="g"))["result"]
+        self.assertEqual((updated["quantity"], updated["remaining_quantity"]), ("2000", "1500"))
+
+    def test_linked_purchase_correction_and_removal_restore_remaining(self) -> None:
+        milk = self.store.handle({
+            "action": "item-add", "request_key": "milk", "name": "Milk", "list_name": "Audit",
+            "quantity": "6", "unit": "bottles",
+        })["result"]
+        logged = self.store.handle({
+            "action": "purchase-log", "request_key": "buy", "item_id": milk["id"],
+            "bought_on": "2026-11-24", "quantity": "8", "unit": "bottles",
+        })["result"]
+        purchase_id = logged["purchase"]["id"]
+        update = {"action": "purchase-update", "request_key": "fix", "id": purchase_id, "quantity": "1"}
+        with self.assertRaisesRegex(shopping_store.StoreError, "incompatible_units"):
+            self.store.handle(dict(update, unit="kg"))
+        self.assertEqual(self.store.handle({"action": "purchase-list"})["result"][0]["quantity"], "8")
+        corrected = self.store.handle(update)["result"]
+        self.assertEqual(self.store.handle(update)["result"], corrected)
+        partial = self.store.handle({"action": "item-get", "id": milk["id"]})["result"]
+        self.assertEqual((partial["status"], partial["remaining_quantity"]), ("partially_bought", "5"))
+        self.assertEqual(partial["revision"], milk["revision"] + 2)
+        self.store.handle({"action": "purchase-remove", "request_key": "remove", "id": purchase_id, "confirm": True})
+        reopened = self.store.handle({"action": "item-get", "id": milk["id"]})["result"]
+        self.assertEqual((reopened["status"], reopened["remaining_quantity"]), ("needed", "6"))
+
+    def test_stale_edit_requires_explicit_history_only_choice(self) -> None:
+        item = self.store.handle({
+            "action": "item-add", "request_key": "milk", "name": "Milk", "list_name": "Audit",
+            "quantity": "6", "unit": "bottles",
+        })["result"]
+        logged = self.store.handle({
+            "action": "purchase-log", "request_key": "buy", "item_id": item["id"],
+            "bought_on": "2026-11-24", "quantity": "4", "unit": "bottles",
+        })["result"]
+        changed = self.store.handle({
+            "action": "item-update", "id": item["id"], "request_key": "manual",
+            "expected_revision": logged["updated_item"]["revision"], "remaining_quantity": "3",
+        })["result"]
+        purchase_id = logged["purchase"]["id"]
+        update = {"action": "purchase-update", "id": purchase_id, "request_key": "fix", "quantity": "1"}
+        remove = {"action": "purchase-remove", "id": purchase_id, "request_key": "remove", "confirm": True}
+        for request in (update, remove):
+            with self.assertRaisesRegex(shopping_store.StoreError, "purchase_item_state_requires_review"):
+                self.store.handle(request)
+        self.assertEqual(self.store.handle({"action": "purchase-list"})["result"][0]["quantity"], "4")
+        self.store.handle(dict(update, keep_item_state=True))
+        self.assertEqual(self.store.handle({"action": "purchase-list"})["result"][0]["quantity"], "1")
+        override = dict(remove, keep_item_state=True)
+        removed = self.store.handle(override)
+        self.assertEqual(self.store.handle(override), removed)
+        self.assertEqual(self.store.handle({"action": "purchase-list"})["result"], [])
+        self.assertEqual(self.store.handle({"action": "item-get", "id": item["id"]})["result"], changed)
+
+    def test_snapshot_preserves_fulfillment_and_accepts_legacy_shape(self) -> None:
+        item = self.store.handle({
+            "action": "item-add", "request_key": "coffee", "name": "Coffee", "list_name": "Audit",
+        })["result"]
+        logged = self.store.handle({
+            "action": "purchase-log", "request_key": "buy", "item_id": item["id"],
+            "bought_on": "2026-11-24", "fulfillment_mode": "mark_bought",
+        })["result"]
+        snapshot = self.store.handle({"action": "export"})["result"]
+        remove = {
+            "action": "purchase-remove", "id": logged["purchase"]["id"], "request_key": "remove", "confirm": True,
+        }
+        restored = shopping_store.Store(Path(self.tmp.name) / "restored")
+        restored.handle({"action": "import", "request_key": "import", "data": snapshot})
+        self.assertEqual(restored.handle({"action": "export"})["result"], snapshot)
+        restored.handle(remove)
+        self.assertEqual(restored.handle({"action": "item-get", "id": item["id"]})["result"]["status"], "needed")
+
+        snapshot["schema_version"] = 1
+        del snapshot["purchases"][0]["fulfillment"]
+        legacy = shopping_store.Store(Path(self.tmp.name) / "legacy")
+        legacy.handle({"action": "import", "request_key": "import", "data": snapshot})
+        with self.assertRaisesRegex(shopping_store.StoreError, "purchase_item_state_requires_review"):
+            legacy.handle(remove)
+        legacy.handle(dict(remove, keep_item_state=True))
+        self.assertEqual(legacy.handle({"action": "item-get", "id": item["id"]})["result"]["status"], "bought")
+
+        self.store.handle({"action": "item-remove", "id": item["id"], "request_key": "remove-item"})
+        detached = self.store.handle({"action": "export"})["result"]
+        self.assertIsNone(detached["purchases"][0]["shopping_item_id"])
+        self.assertIsNone(detached["purchases"][0]["fulfillment"])
+        target = shopping_store.Store(Path(self.tmp.name) / "detached")
+        target.handle({"action": "import", "request_key": "import", "data": detached})
+        self.assertEqual(target.handle({"action": "export"})["result"], detached)
+
     def test_spending_summary_marks_incomplete_totals_and_uses_exact_decimals(self) -> None:
         self.store.handle({
             "action": "purchase-log",

@@ -21,8 +21,8 @@ from typing import Any, Callable
 import unicodedata
 import uuid
 
-VERSION = "0.1.0"
-SCHEMA_VERSION = 1
+VERSION = "0.1.1"
+SCHEMA_VERSION = 2
 
 LIST_KINDS = ("supermarket", "home", "gifts", "pharmacy", "personal_care", "custom")
 PRIORITIES = ("low", "normal", "high", "urgent")
@@ -553,7 +553,8 @@ SCHEMA = (
     "finished_on TEXT, "
     "actual_duration_days INTEGER CHECK(actual_duration_days IS NULL OR actual_duration_days >= 1), "
     "created_at TEXT NOT NULL, "
-    "updated_at TEXT NOT NULL"
+    "updated_at TEXT NOT NULL, "
+    "fulfillment TEXT"
     ")",
     "CREATE TABLE mutation_requests ("
     "request_key TEXT PRIMARY KEY, "
@@ -571,7 +572,12 @@ SCHEMA = (
     "CREATE INDEX purchases_store_date ON purchases(store, bought_on DESC, id)",
 )
 
-MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {}
+
+def migrate_purchase_fulfillment(con: sqlite3.Connection) -> None:
+    con.execute("ALTER TABLE purchases ADD COLUMN fulfillment TEXT")
+
+
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {1: migrate_purchase_fulfillment}
 
 
 def validate_snapshot(data: Any) -> dict[str, Any]:
@@ -632,7 +638,7 @@ def validate_snapshot(data: Any) -> dict[str, Any]:
         parse_decimal(value, "import_decimal", allow_zero=allow_zero)
 
     check_fields(data, {"schema_version", *EXPORT_TABLES})
-    if type(data["schema_version"]) is not int or data["schema_version"] != 1:
+    if type(data["schema_version"]) is not int or data["schema_version"] not in (1, 2):
         raise StoreError("unsupported_import_schema")
 
     shapes = {
@@ -656,6 +662,8 @@ def validate_snapshot(data: Any) -> dict[str, Any]:
             "expected_next_on", "finished_on", "actual_duration_days", "created_at", "updated_at",
         },
     }
+    if data["schema_version"] == 2:
+        shapes["purchases"].add("fulfillment")
 
     ids: dict[str, set[str]] = {}
     for table in EXPORT_TABLES:
@@ -740,6 +748,7 @@ def validate_snapshot(data: Any) -> dict[str, Any]:
         if row["resolved_at"] is not None:
             check_stamp(row["resolved_at"])
 
+    items_by_id = {row["id"]: row for row in data["shopping_items"]}
     for row in data["purchases"]:
         check_ref(row["product_id"], ids["products"], nullable=True)
         check_ref(row["shopping_item_id"], ids["shopping_items"], nullable=True)
@@ -755,6 +764,27 @@ def validate_snapshot(data: Any) -> dict[str, Any]:
         check_date(row["expected_next_on"], nullable=True)
         check_date(row["finished_on"], nullable=True)
         check_int(row["actual_duration_days"], minimum=1, nullable=True)
+        effect = row.get("fulfillment")
+        if effect is not None:
+            if not isinstance(effect, dict) or row["shopping_item_id"] is None:
+                raise StoreError("invalid_import_fulfillment")
+            mode = effect.get("mode")
+            check_enum(mode, FULFILLMENT_MODES)
+            if mode == "keep_open":
+                check_fields(effect, {"mode"})
+            else:
+                check_fields(effect, {"mode", "revision", "status", "remaining_quantity"})
+                check_enum(effect["status"], ITEM_OPEN_STATUSES)
+                check_int(effect["revision"], minimum=2)
+                check_dec(effect["remaining_quantity"], allow_zero=True)
+                item = items_by_id[row["shopping_item_id"]]
+                if effect["revision"] > item["revision"]:
+                    raise StoreError("invalid_import_fulfillment")
+                if effect["revision"] == item["revision"] and (
+                    (effect["remaining_quantity"] is None) != (item["quantity"] is None)
+                    or (item["product_id"] is not None and row["product_id"] != item["product_id"])
+                ):
+                    raise StoreError("invalid_import_fulfillment")
 
     return data
 
@@ -1044,14 +1074,14 @@ class Store:
                 {
                     "id", "request_key", "bought_on", "quantity", "unit", "brand",
                     "store", "price", "currency", "notes", "expected_next_on",
-                    "finished_on", "actual_duration_days",
+                    "finished_on", "actual_duration_days", "keep_item_state",
                 },
             ),
             "purchase-list": (
                 self._purchase_list,
                 {"product_id", "query", "store", "list_id", "list_name", "category", "on", "from_date", "to_date", "limit", "offset"},
             ),
-            "purchase-remove": (self._purchase_remove, {"id", "request_key", "confirm"}),
+            "purchase-remove": (self._purchase_remove, {"id", "request_key", "confirm", "keep_item_state"}),
             "spending-summary": (
                 self._spending_summary,
                 {"store", "list_id", "list_name", "category", "product_id", "on", "from_date", "to_date"},
@@ -1932,6 +1962,11 @@ class Store:
 
         qty = payload["quantity"] if "quantity" in payload else current["quantity"]
         status = payload.get("status", current["status"])
+        convert_existing = "quantity" not in payload and qty is not None and unit != current["unit"]
+        if convert_existing:
+            qty = parse_decimal(
+                format_decimal(convert_quantity(Decimal(qty), current["unit"], unit)), "quantity"
+            )
         if "remaining_quantity" in payload:
             rem = payload["remaining_quantity"]
             if (qty is None) != (rem is None):
@@ -1958,6 +1993,11 @@ class Store:
                 rem = qty
         else:
             rem = current["remaining_quantity"]
+            if convert_existing and rem is not None:
+                rem = parse_decimal(
+                    format_decimal(convert_quantity(Decimal(rem), current["unit"], unit)),
+                    "remaining_quantity", allow_zero=True,
+                )
 
         if (
             current["status"] in ("bought", "cancelled")
@@ -2076,6 +2116,30 @@ class Store:
     # Purchases & Spending
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _write_item_fulfillment(
+        con: sqlite3.Connection, item: sqlite3.Row, status: str, remaining: str | None, stamp: str
+    ) -> None:
+        con.execute(
+            "UPDATE shopping_items SET remaining_quantity=?, status=?, resolved_at=?, "
+            "revision=revision+1, updated_at=? WHERE id=?",
+            (remaining, status, stamp if status == "bought" else None, stamp, item["id"]),
+        )
+
+    @staticmethod
+    def _apply_purchase_fulfillment(
+        con: sqlite3.Connection, item: sqlite3.Row, effect: dict[str, Any],
+        quantity: str | None, unit: str, stamp: str,
+    ) -> None:
+        remaining = effect["remaining_quantity"]
+        if effect["mode"] == "auto" and remaining is not None and quantity is not None:
+            bought = convert_quantity(Decimal(quantity), unit, item["unit"])
+            balance = Decimal(remaining) - bought
+            if balance > 0:
+                Store._write_item_fulfillment(con, item, "partially_bought", format_decimal(balance), stamp)
+                return
+        Store._write_item_fulfillment(con, item, "bought", "0" if item["quantity"] is not None else None, stamp)
+
     def _purchase_log(self, con: sqlite3.Connection, req: dict[str, Any]) -> dict[str, Any]:
         key = text_field(req, "request_key", limit=200)
         bought_on = date_field(req, "bought_on").isoformat()
@@ -2163,18 +2227,31 @@ class Store:
         elif item_row is not None:
             resolved_list = con.execute("SELECT * FROM lists WHERE id=?", (item_row["list_id"],)).fetchone()
 
+        item_product_id = item_row["product_id"] if item_row is not None else None
+        if item_row is not None and item_product_id is None:
+            item_product = self._find_product_by_name_or_alias(con, item_row["name"])
+            item_product_id = item_product["id"] if item_product is not None else None
+        if item_row is not None and product_id is not None and product_id != item_product_id:
+            raise StoreError("purchase_product_mismatch")
         product_row = None
         if product_id is not None:
             product_row = con.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
             if not product_row:
                 raise StoreError("product_not_found")
-        elif item_row is not None and item_row["product_id"]:
-            product_row = con.execute("SELECT * FROM products WHERE id=?", (item_row["product_id"],)).fetchone()
+        elif item_product_id is not None:
+            product_row = con.execute("SELECT * FROM products WHERE id=?", (item_product_id,)).fetchone()
+        if product_name is not None and (item_row is not None or product_row is not None):
+            named = self._find_product_by_name_or_alias(con, product_name)
+            if named is not None:
+                matches = product_row is not None and named["id"] == product_row["id"]
+            else:
+                matches = item_row is not None and normalized(product_name) == normalized(item_row["name"])
+            if not matches:
+                raise StoreError("purchase_product_mismatch")
 
         effective_name = product_name or (product_row["name"] if product_row else item_row["name"])
         effective_category = category or (item_row["category"] if item_row else (product_row["default_category"] if product_row else ""))
         effective_brand = brand or (item_row["brand"] if item_row else "")
-        effective_store = store or (item_row["preferred_store"] if item_row else "")
         effective_list_id = (
             resolved_list["id"]
             if resolved_list is not None
@@ -2189,7 +2266,7 @@ class Store:
                 default_category=effective_category,
                 default_unit=unit,
                 default_brand=effective_brand,
-                default_store=effective_store,
+                default_store=store,
             )
         if effective_list_id is None and product_row["default_list_id"]:
             effective_list_id = product_row["default_list_id"]
@@ -2205,58 +2282,33 @@ class Store:
             )
 
         updated_item = None
-        if item_row is not None and fulfillment_mode != "keep_open":
-            if fulfillment_mode == "mark_bought":
-                new_rem = "0" if item_row["quantity"] is not None else None
-                con.execute(
-                    "UPDATE shopping_items SET remaining_quantity=?, status='bought', resolved_at=?, "
-                    "revision=revision+1, updated_at=? WHERE id=?",
-                    (new_rem, stamp, stamp, item_row["id"]),
+        fulfillment = None
+        if item_row is not None:
+            effect = {"mode": fulfillment_mode}
+            if fulfillment_mode != "keep_open":
+                effect.update(
+                    status=item_row["status"], remaining_quantity=item_row["remaining_quantity"],
+                    revision=item_row["revision"] + 1,
                 )
-            else:
-                # Auto fulfillment: subtract only with verified compatible units when both quantities are known.
-                if item_row["remaining_quantity"] is not None and quantity is not None:
-                    bought_in_item_unit = convert_quantity(
-                        Decimal(quantity), unit, item_row["unit"]
-                    )
-                    remaining = Decimal(item_row["remaining_quantity"]) - bought_in_item_unit
-                    if remaining > Decimal("0"):
-                        new_status = "partially_bought"
-                        new_rem = format_decimal(remaining)
-                        resolved_at = None
-                    else:
-                        new_status = "bought"
-                        new_rem = "0"
-                        resolved_at = stamp
-                    con.execute(
-                        "UPDATE shopping_items SET remaining_quantity=?, status=?, resolved_at=?, "
-                        "revision=revision+1, updated_at=? WHERE id=?",
-                        (new_rem, new_status, resolved_at, stamp, item_row["id"]),
-                    )
-                else:
-                    new_rem = "0" if item_row["quantity"] is not None else None
-                    con.execute(
-                        "UPDATE shopping_items SET remaining_quantity=?, status='bought', resolved_at=?, "
-                        "revision=revision+1, updated_at=? WHERE id=?",
-                        (new_rem, stamp, stamp, item_row["id"]),
-                    )
-            updated_item = self._hydrate_item(self._fetch_item_row(con, item_row["id"]))
+                self._apply_purchase_fulfillment(con, item_row, effect, quantity, unit, stamp)
+                updated_item = self._hydrate_item(self._fetch_item_row(con, item_row["id"]))
+            fulfillment = json.dumps(effect)
 
         purchase_id = uuid.uuid4().hex
         search_text = self._purchase_search_text(
-            effective_name, effective_category, effective_brand, effective_store, notes
+            effective_name, effective_category, effective_brand, store, notes
         )
         con.execute(
             "INSERT INTO purchases ("
             "id, product_id, shopping_item_id, list_id, product_name, search_text, category, "
             "bought_on, quantity, unit, brand, store, price, currency, notes, "
-            "expected_next_on, finished_on, actual_duration_days, created_at, updated_at"
-            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,?,?)",
+            "expected_next_on, finished_on, actual_duration_days, created_at, updated_at, fulfillment"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,?,?,?)",
             (
                 purchase_id, product_row["id"], item_row["id"] if item_row else None,
                 effective_list_id, effective_name, search_text, effective_category,
-                bought_on, quantity, unit, effective_brand, effective_store, price,
-                currency, notes, expected_next_on, stamp, stamp,
+                bought_on, quantity, unit, effective_brand, store, price,
+                currency, notes, expected_next_on, stamp, stamp, fulfillment,
             ),
         )
         hydrated_product = self._fetch_product_hydrated(con, product_row["id"])
@@ -2275,6 +2327,16 @@ class Store:
             "suggested_next_on": suggested_next_on,
         }
         return self._record_receipt(con, key, "purchase-log", req_hash, result)
+
+    def _item_for_fulfillment_change(
+        self, con: sqlite3.Connection, purchase: sqlite3.Row, effect: dict[str, Any] | None
+    ) -> sqlite3.Row:
+        if effect is None:
+            raise StoreError("purchase_item_state_requires_review")
+        item = self._fetch_item_row(con, purchase["shopping_item_id"])
+        if item["revision"] != effect["revision"]:
+            raise StoreError("purchase_item_state_requires_review")
+        return item
 
     def _purchase_update(self, con: sqlite3.Connection, req: dict[str, Any]) -> dict[str, Any]:
         ident = text_field(req, "id", limit=200)
@@ -2308,6 +2370,8 @@ class Store:
             )
         if set(payload) == {"id"}:
             raise StoreError("purchase_update_requires_fields")
+        if "keep_item_state" in req:
+            payload["keep_item_state"] = boolean_field(req, "keep_item_state")
 
         req_hash, replayed = self._replay_receipt(con, "purchase-update", key, payload)
         if replayed is not None:
@@ -2330,6 +2394,20 @@ class Store:
 
         quantity = payload["quantity"] if "quantity" in payload else current["quantity"]
         unit = payload.get("unit", current["unit"])
+        stamp = now()
+        fulfillment = current["fulfillment"]
+        if current["shopping_item_id"] is not None and (quantity, unit) != (current["quantity"], current["unit"]):
+            effect = json.loads(fulfillment) if fulfillment is not None else None
+            if effect is None or effect["mode"] == "auto":
+                if payload.get("keep_item_state"):
+                    # The original effect no longer describes the corrected purchase.
+                    fulfillment = None
+                else:
+                    item = self._item_for_fulfillment_change(con, current, effect)
+                    assert effect is not None
+                    self._apply_purchase_fulfillment(con, item, effect, quantity, unit, stamp)
+                    effect["revision"] = item["revision"] + 1
+                    fulfillment = json.dumps(effect)
         brand = payload.get("brand", current["brand"])
         store = payload.get("store", current["store"])
         price = payload["price"] if "price" in payload else current["price"]
@@ -2344,10 +2422,10 @@ class Store:
         con.execute(
             "UPDATE purchases SET bought_on=?, quantity=?, unit=?, brand=?, store=?, price=?, "
             "currency=?, notes=?, search_text=?, expected_next_on=?, finished_on=?, "
-            "actual_duration_days=?, updated_at=? WHERE id=?",
+            "actual_duration_days=?, updated_at=?, fulfillment=? WHERE id=?",
             (
                 bought_on, quantity, unit, brand, store, price, currency, notes, search_text,
-                expected_next_on, finished_on, actual_duration_days, now(), ident,
+                expected_next_on, finished_on, actual_duration_days, stamp, fulfillment, ident,
             ),
         )
         updated = self._hydrate_purchase(self._fetch_purchase_row(con, ident))
@@ -2359,10 +2437,19 @@ class Store:
         if not boolean_field(req, "confirm", False):
             raise StoreError("purchase_remove_requires_confirmation")
         payload = {"id": ident, "confirm": True}
+        if "keep_item_state" in req:
+            payload["keep_item_state"] = boolean_field(req, "keep_item_state")
         req_hash, replayed = self._replay_receipt(con, "purchase-remove", key, payload)
         if replayed is not None:
             return replayed
-        self._fetch_purchase_row(con, ident)
+        purchase = self._fetch_purchase_row(con, ident)
+        if purchase["shopping_item_id"] is not None and not payload.get("keep_item_state"):
+            raw_effect = purchase["fulfillment"]
+            effect = json.loads(raw_effect) if raw_effect is not None else None
+            if effect is None or effect["mode"] != "keep_open":
+                item = self._item_for_fulfillment_change(con, purchase, effect)
+                assert effect is not None
+                self._write_item_fulfillment(con, item, effect["status"], effect["remaining_quantity"], now())
         con.execute("DELETE FROM purchases WHERE id=?", (ident,))
         return self._record_receipt(con, key, "purchase-remove", req_hash, {"id": ident, "removed": True})
 
@@ -2899,14 +2986,14 @@ class Store:
         for entry in items:
             entry.pop("list_name", None)
             entry.pop("list_kind", None)
-        purchases = [
-            self._hydrate_purchase(r)
-            for r in con.execute(
-                "SELECT p.*, '' AS list_name FROM purchases p ORDER BY p.id"
-            ).fetchall()
-        ]
-        for entry in purchases:
+        purchases = []
+        for row in con.execute("SELECT p.*, '' AS list_name FROM purchases p ORDER BY p.id"):
+            entry = self._hydrate_purchase(row)
             entry.pop("list_name", None)
+            # Deleting an item detaches its purchases through the foreign key.
+            raw_effect = row["fulfillment"] if row["shopping_item_id"] is not None else None
+            entry["fulfillment"] = json.loads(raw_effect) if raw_effect is not None else None
+            purchases.append(entry)
         return {
             "schema_version": SCHEMA_VERSION,
             "lists": lists,
@@ -2991,15 +3078,16 @@ class Store:
             search_text = self._purchase_search_text(
                 row["product_name"], row["category"], row["brand"], row["store"], row["notes"]
             )
+            effect = row.get("fulfillment")
             con.execute(
-                "INSERT INTO purchases VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO purchases VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     row["id"], row["product_id"], row["shopping_item_id"], row["list_id"],
                     row["product_name"], search_text, row["category"], row["bought_on"],
                     row["quantity"], row["unit"], row["brand"], row["store"], row["price"],
                     row["currency"], row["notes"], row["expected_next_on"],
                     row["finished_on"], row["actual_duration_days"],
-                    row["created_at"], row["updated_at"],
+                    row["created_at"], row["updated_at"], json.dumps(effect) if effect is not None else None,
                 ),
             )
 
